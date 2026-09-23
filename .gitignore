@@ -1,0 +1,6 @@
+.gitconfig-secure
+*.pdf
+*.pem
+*.key
+.env
+slides/
