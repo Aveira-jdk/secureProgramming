@@ -4,3 +4,7 @@
 *.key
 .env
 slides/
+obj/
+spm
+vault.bin
+*.o
