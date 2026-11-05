@@ -3,6 +3,7 @@
 
 #include <ctype.h>
 #include <stdio.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -26,12 +27,36 @@ static int find_service(const Credential *entries, size_t count, const char *ser
     return -1;
 }
 
+// Copy password to system clipboard without showing it on screen.
+static int copy_to_clipboard(const char *password) {
+    // Check if any supported clipboard tool is installed.
+    if (system("command -v wl-copy >/dev/null 2>&1 || command -v xclip >/dev/null 2>&1 || command -v clip.exe >/dev/null 2>&1") != 0) {
+        return -1;
+    }
+    // Run clipboard tool in the background so the program does not hang.
+    FILE *pipe = popen("(wl-copy 2>/dev/null || xclip -selection clipboard 2>/dev/null || clip.exe 2>/dev/null) &", "w");
+    if (!pipe) return -1;
+
+    // Ignore broken pipe signal if clipboard tool closes early.
+    void (*old_handler)(int) = signal(SIGPIPE, SIG_IGN);
+    if (old_handler == SIG_ERR) { pclose(pipe); return -1; }
+
+    // Send the password into the clipboard tool.
+    int ok = fputs(password, pipe) >= 0;
+    if (pclose(pipe) != 0) ok = 0;
+    signal(SIGPIPE, old_handler);
+    return ok ? 0 : -1;
+}
+
 // Print command help and how to use the program.
 static void usage(const char *program) {
-    printf("Usage: %s <init|add|list> [service]\n"
+    printf("Usage: %s <init|add|list|get|del|help> [service]\n"
            "  init          Create the vault\n"
            "  add <service> Add or update an entry\n"
-           "  list          Show saved services and usernames\n", program);
+           "  list          Show saved services and usernames\n"
+           "  get <service> Copy a password to the clipboard\n"
+           "  del <service> Delete an entry\n"
+           "  help          Show this help text\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -41,10 +66,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Check if user provided too few arguments.
-    if (argc < 2) {
+    // Check if user asked for help.
+    if (argc < 2 || strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0) {
         usage(argv[0]);
-        return 1;
+        return argc < 2 ? 1 : 0;
     }
 
     // Check which command was requested.
@@ -52,9 +77,11 @@ int main(int argc, char **argv) {
     int is_init = strcmp(command, "init") == 0;
     int is_list = strcmp(command, "list") == 0;
     int is_add = strcmp(command, "add") == 0;
+    int is_get = strcmp(command, "get") == 0;
+    int is_del = strcmp(command, "del") == 0;
 
     // Validate command name and argument count.
-    if (!is_init && !is_list && !is_add) {
+    if (!is_init && !is_list && !is_add && !is_get && !is_del) {
         usage(argv[0]);
         return 1;
     }
@@ -62,7 +89,7 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 1;
     }
-    if (is_add && (argc != 3 || !valid_service(argv[2]))) {
+    if ((is_add || is_get || is_del) && (argc != 3 || !valid_service(argv[2]))) {
         usage(argv[0]);
         return 1;
     }
@@ -139,6 +166,41 @@ int main(int argc, char **argv) {
             goto done;
         }
         puts("Entry saved.");
+        status = 0;
+    }
+    // Handle get: copy password to clipboard.
+    else if (is_get) {
+        int index = find_service(entries, count, argv[2]);
+        if (index < 0) {
+            fputs("Entry not found.\n", stderr);
+            goto done;
+        }
+        if (copy_to_clipboard(entries[index].password) != 0) {
+            fputs("Could not copy to clipboard.\n", stderr);
+            goto done;
+        }
+        puts("Clipboard helper started.");
+        status = 0;
+    }
+    // Handle del: remove entry and shift remaining ones left.
+    else if (is_del) {
+        int index = find_service(entries, count, argv[2]);
+        if (index < 0) {
+            fputs("Entry not found.\n", stderr);
+            goto done;
+        }
+        for (size_t i = (size_t)index + 1; i < count; i++) {
+            entries[i - 1] = entries[i];
+        }
+        // Wipe the last slot that is now unused.
+        wipe_buffer(&entries[--count], sizeof(entries[0]));
+
+        // Save updated vault to disk.
+        if (vault_save(master, entries, count) != 0) {
+            fputs("Could not save the vault.\n", stderr);
+            goto done;
+        }
+        puts("Entry deleted.");
         status = 0;
     }
 

@@ -1,29 +1,26 @@
-# Secure Password Manager (Provisional)
+# Secure Password Manager
 
-Secure Password Manager (SPM) is a CLI password manager written in C for the ICS0022. It will let a user store, view, and delete passwords in one encrypted vault file.
+Secure Password Manager (SPM) is a single-user CLI password manager written in C for the ICS0022 Secure Programming course. It lets a user store, view, and delete credentials inside one encrypted vault file (`vault.bin`).
 
-## Scope and planned commands
+## Scope and commands
 
-- `./spm init` — create a vault and set a master password.
-- `./spm add <service>` — add a username and password.
-- `./spm get <service>` — show a saved username and password.
-- `./spm del <service>` — delete an entry.
+- `./spm init`: Create a new vault and set a master password.
+- `./spm add <service>`: Add or update a username and password for a service.
+- `./spm list`: Show saved services and usernames (passwords are never shown).
+- `./spm get <service>`: Copy a password directly to the system clipboard without printing it.
+- `./spm del <service>`: Delete an entry from the vault.
+- `./spm help`: Show command usage.
 
 ## Design choices
 
-SPM will use `libsodium` for encryption and key derivation. It provides tested cryptographic functions, so the project does not need to implement encryption itself.
+SPM uses `libsodium` for cryptographic operations and key derivation:
 
-Argon2id will turn the master password into an encryption key. XChaCha20-Poly1305 will encrypt the whole vault and detect changes to its contents.
-
-The vault file will contain a version number, a random salt, the Argon2id settings, a random nonce, and encrypted data. It will not contain the master password or encryption key.
-
-Before encryption, entries will use this text format:
-
-```text
-base64(service):base64(username):base64(password)
-```
-
-Each entry will be on its own line. Base64 keeps `:` and newlines inside a field from breaking the format. The program will check field lengths and reject invalid data.
+- **Key derivation:** `Argon2id` (`crypto_pwhash`) turns the master password into an encryption key using a fresh 16-byte random salt. The master password itself is never written to disk.
+- **Authenticated encryption:** `XChaCha20-Poly1305` (`crypto_aead_xchacha20poly1305_ietf`) encrypts all vault entries. If the password is wrong or the file was changed, decryption fails immediately.
+- **Binary records format:** Entries use fixed-size binary records (`Credential` struct) instead of text files. This avoids delimiter bugs and string injection problems.
+- **Atomic file writes:** Changes are written to a temporary file first. The file is synced to disk with `fsync()` and moved into place with `rename()`. Permissions are restricted to owner-only (`0600`). This protects against file corruption if interrupted.
+- **Memory safety:** Passwords, keys, and decrypted records are wiped from memory using `sodium_memzero()` before the program exits.
+- **Hidden input and clipboard output:** Typing is hidden with `<termios.h>` when entering passwords. The `get` command copies passwords directly to clipboard tools (`wl-copy`, `xclip`, `clip.exe`). Passwords never appear on screen or in shell history.
 
 ## Architecture
 
@@ -31,44 +28,66 @@ Each entry will be on its own line. Base64 keeps `:` and newlines inside a field
 flowchart LR
     User((User)) --> CLI[Command-line interface]
     CLI -->|master password| Key[User management: Argon2id]
-    Key -->|key| Crypto[Encryption module]
+    Key -->|key| Crypto[Encryption module: XChaCha20-Poly1305]
     CLI <-->|entries| Crypto
     Crypto <-->|encrypted data| Storage[Storage layer]
-    Storage <-->|read and write| Vault[(Vault file on disk)]
+    Storage <-->|atomic read and write| Vault[(vault.bin on disk)]
 ```
 
-The command-line interface takes commands and asks for the master password. User management derives a key from that password. The encryption module uses the key to decrypt or encrypt vault entries. The storage layer reads and writes the vault file.
-
-The master password, key, and decrypted entries exist in the running program's memory. The vault file on disk holds encrypted entries.
+- **Command-line interface (`src/main.c`):** Parses arguments, validates inputs, and coordinates commands.
+- **User management & crypto (`src/vault.c`):** Uses `Argon2id` to derive the vault key, and `XChaCha20-Poly1305` to encrypt and decrypt records.
+- **Storage layer (`src/vault.c`):** Manages file I/O, atomic temporary file replacement, file permissions, and data integrity.
+- **Vault file (`vault.bin`):** Holds a 16-byte random salt, a 24-byte random nonce, and the encrypted records with a 16-byte Poly1305 authentication tag.
 
 ## Threat model
 
-| Area | Threat | Planned mitigation |
+| Area | Threat | Implemented mitigation |
 |---|---|---|
-| Master password | Someone copies the vault file and tries to guess the master password. | Use Argon2id with a random salt so each guess takes time and memory. |
-| Vault on disk | Someone reads the vault file. | Encrypt the whole vault with XChaCha20-Poly1305. |
-| Vault on disk | Someone changes the vault file. | Check the authentication tag during decryption and reject changed data. |
-| Vault in memory | Passwords or keys remain in memory after use. | Clear the master password, key, and decrypted vault data with `sodium_memzero()` when they are no longer needed. Use `sodium_mlock()` where possible to reduce swapping. |
-| Interface | Long or invalid input causes a crash or buffer overflow. | Set size limits, check input lengths and return values, and reject invalid input. |
-| Interface | A password shown by `get` remains visible in the terminal. | Show it only when requested. Users should run SPM in a trusted terminal and be aware of terminal scrollback. |
+| Master password | Someone copies the vault file and tries to guess the master password. | `Argon2id` with a 16-byte random salt makes guessing the password very slow and memory-heavy. |
+| Vault on disk | Someone reads the vault file directly. | All entries are encrypted at rest with `XChaCha20-Poly1305`. File permissions are set to owner-only (`0600`). |
+| Vault on disk | Someone alters or corrupts bytes in the vault file. | Poly1305 checks the data during decryption. Any altered byte causes immediate rejection with a generic error. |
+| Vault in memory | Passwords or keys remain in RAM after the program finishes. | Master passwords, keys, and decrypted records are wiped with `sodium_memzero()` before exit. |
+| Interface | Oversized input or invalid characters cause memory corruption. | Input lengths are limited with `fgets()`. Extra characters in stdin are cleared, and service names only allow printable characters. |
+| Interface | A retrieved password remains visible in terminal scrollback. | Passwords are never printed on screen. The `get` command sends the secret straight to system clipboard helpers (`wl-copy`, `xclip`, `clip.exe`). |
 
-## Planned build and run
+## Build and run
 
-SPM is intended to run on Ubuntu or WSL. The planned dependencies are a C compiler and `libsodium-dev`:
+### Prerequisites (Ubuntu or WSL)
 
 ```bash
-sudo apt-get update
-sudo apt-get install build-essential libsodium-dev
-gcc -Wall -Wextra -Werror -o spm *.c -lsodium
+sudo apt update
+sudo apt install -y build-essential libsodium-dev wl-clipboard xclip
 ```
 
-Once the C source files are added, the program will be compiled with `gcc`, using `-Wall -Wextra -Werror` and linking against `libsodium`. The exact build command will be added when the source file names are known.
+### Build
 
-The planned way to run it is:
+Compile the program with security flags (`-Wall -Wextra -Werror -pedantic -fanalyzer -D_FORTIFY_SOURCE=2 -fstack-protector-strong`):
 
 ```bash
+make
+```
+
+To clean build artifacts:
+
+```bash
+make clean
+```
+
+### Usage example
+
+```bash
+# 1. Initialize a new vault
 ./spm init
+
+# 2. Add an entry
 ./spm add github
+
+# 3. List entries (shows services and usernames, never passwords)
+./spm list
+
+# 4. Copy password to clipboard
 ./spm get github
+
+# 5. Delete an entry
 ./spm del github
 ```
