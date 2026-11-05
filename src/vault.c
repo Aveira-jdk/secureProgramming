@@ -1,260 +1,254 @@
+#define _POSIX_C_SOURCE 200809L
 #include "vault.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <termios.h>
 #include <sys/stat.h>
+#include <termios.h>
+#include <unistd.h>
 #include <sodium.h>
 
-// Worst-case capacity: 50 entries * (64 + 64 + 128 + 3 delimiters) = 12950 bytes
-#define TEXT_BUF_SIZE 16384
+// File header size: 16-byte salt plus 24-byte nonce.
+#define HEADER_SIZE (crypto_pwhash_SALTBYTES + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES)
 
-// sodium_memzero is used instead of memset because compilers may optimise
-// away standard memset calls when buffers are no longer referenced, leaving
-// sensitive material in RAM.
+// Maximum encrypted size: 50 entries plus 16-byte authentication tag.
+#define MAX_CIPHER_SIZE (MAX_ENTRIES * sizeof(Credential) + crypto_aead_xchacha20poly1305_ietf_ABYTES)
+
+// Overwrite memory with zeros so secrets do not stay in RAM.
 void wipe_buffer(void *ptr, size_t size) {
-    if (ptr && size > 0) {
-        sodium_memzero(ptr, size);
-    }
+    if (ptr && size) sodium_memzero(ptr, size);
 }
 
-int prompt_password(const char *prompt, char *buffer, size_t max_size) {
-    if (!buffer || max_size == 0) return -1;
+// Read one line of text from the keyboard.
+int prompt_input(const char *prompt, char *buffer, size_t size, int hidden) {
+    // Check that buffer pointer and size are valid.
+    if (!buffer || size < 2 || size > INT_MAX) return -1;
 
-    if (prompt) {
-        printf("%s", prompt);
-        fflush(stdout);
+    // Show prompt to the user.
+    if (prompt) { fputs(prompt, stdout); fflush(stdout); }
+
+    struct termios old_term;
+    int changed = 0;
+
+    // Turn off terminal echo if input is a secret password.
+    if (hidden && isatty(STDIN_FILENO)) {
+        if (tcgetattr(STDIN_FILENO, &old_term) != 0) return -1;
+        struct termios quiet_term = old_term;
+        quiet_term.c_lflag &= (tcflag_t)~ECHO;
+        if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &quiet_term) != 0) return -1;
+        changed = 1;
     }
 
-    struct termios old_term, new_term;
-    int is_term = isatty(STDIN_FILENO);
+    // Read the line from stdin.
+    char *result = fgets(buffer, (int)size, stdin);
 
-    // tcgetattr returns ENOTTY when standard input is a pipe (e.g. echo pw | ./spm).
-    // Terminal attributes are modified only when input is an interactive terminal.
-    if (is_term) {
-        if (tcgetattr(STDIN_FILENO, &old_term) == 0) {
-            new_term = old_term;
-            new_term.c_lflag &= ~ECHO;
-            tcsetattr(STDIN_FILENO, TCSAFLUSH, &new_term);
-        }
-    }
-
-    char *res = fgets(buffer, (int)max_size, stdin);
-
-    // Restore terminal attributes to avoid leaving terminal echo disabled.
-    if (is_term) {
+    // Restore terminal settings so typing works normally again.
+    if (changed) {
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &old_term);
-        printf("\n");
+        fputc('\n', stdout);
     }
 
-    if (!res) return -1;
+    // Return error if reading failed.
+    if (!result) { wipe_buffer(buffer, size); return -1; }
 
+    // Strip trailing newline character.
     size_t len = strlen(buffer);
-    if (len > 0 && buffer[len - 1] == '\n') {
-        buffer[len - 1] = '\0';
+    if (len && buffer[len - 1] == '\n') {
+        buffer[--len] = '\0';
     }
-
+    // If input exceeded buffer size, clear extra characters to keep stdin clean.
+    else if (!feof(stdin)) {
+        int ch;
+        while ((ch = getchar()) != '\n' && ch != EOF) {}
+        wipe_buffer(buffer, size);
+        return -1;
+    }
     return 0;
 }
 
-// Argon2id key derivation: converts master password and salt into a 32-byte key.
-// Memory-hard design resists GPU and ASIC offline dictionary attacks.
-static int make_key(const char *password, const unsigned char *salt,
-                    unsigned char *key_out) {
-    return crypto_pwhash(key_out, crypto_secretbox_KEYBYTES,
+// Keep reading until all requested bytes are read from the file.
+static int read_all(int fd, void *buffer, size_t size) {
+    unsigned char *p = buffer;
+    while (size) {
+        ssize_t n = read(fd, p, size);
+        // If interrupted by a signal, try reading again.
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        p += n;
+        size -= (size_t)n;
+    }
+    return 0;
+}
+
+// Keep writing until all bytes are saved to the file.
+static int write_all(int fd, const void *buffer, size_t size) {
+    const unsigned char *p = buffer;
+    while (size) {
+        ssize_t n = write(fd, p, size);
+        // If interrupted by a signal, try writing again.
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        p += n;
+        size -= (size_t)n;
+    }
+    return 0;
+}
+
+// Turn the master password into a 32-byte encryption key using Argon2id.
+static int derive_key(const char *password, const unsigned char *salt, unsigned char *key) {
+    return crypto_pwhash(key, crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
                          password, strlen(password), salt,
                          crypto_pwhash_OPSLIMIT_INTERACTIVE,
                          crypto_pwhash_MEMLIMIT_INTERACTIVE,
                          crypto_pwhash_ALG_ARGON2ID13);
 }
 
-int vault_save(const char *master_password, const Credential *entries,
-               size_t count) {
-    if (!master_password || master_password[0] == '\0') return -1;
+// Check that strings are non-empty and end with a null character.
+static int valid_record(const Credential *entry) {
+    return memchr(entry->service, '\0', sizeof(entry->service)) &&
+           memchr(entry->username, '\0', sizeof(entry->username)) &&
+           memchr(entry->password, '\0', sizeof(entry->password)) &&
+           entry->service[0] && entry->username[0] && entry->password[0];
+}
+
+// Encrypt and save all entries into the vault file.
+int vault_save(const char *master_password, const Credential *entries, size_t count) {
+    // Validate arguments before doing any work.
+    if (!master_password || !master_password[0] || count > MAX_ENTRIES || (count && !entries)) return -1;
+    for (size_t i = 0; i < count; i++) {
+        if (!valid_record(&entries[i])) return -1;
+    }
 
     unsigned char salt[crypto_pwhash_SALTBYTES];
-    unsigned char nonce[crypto_secretbox_NONCEBYTES];
-    unsigned char key[crypto_secretbox_KEYBYTES];
+    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+    unsigned char key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
+    unsigned char cipher[MAX_CIPHER_SIZE];
+    unsigned long long cipher_len = 0;
 
-    // Preserve existing salt across updates to ensure consistent key derivation.
-    // A fresh salt is generated only when creating a new vault file.
-    int fd = open(VAULT_FILE, O_RDONLY | O_NOFOLLOW);
-    if (fd < 0 || read(fd, salt, sizeof(salt)) != sizeof(salt)) {
-        randombytes_buf(salt, sizeof(salt));
-    }
-    if (fd >= 0) close(fd);
-
-    // Nonce must be unique for each encryption operation.
-    // Reusing nonces under the same key compromises stream cipher confidentiality.
+    // Pick a new random salt and a new random nonce for each save.
+    randombytes_buf(salt, sizeof(salt));
     randombytes_buf(nonce, sizeof(nonce));
 
-    if (make_key(master_password, salt, key) != 0) {
-        return -1;
-    }
-
-    // Serialise entries as "service:username:password\n" records.
-    // Colons in service and username fields are restricted at input boundaries.
-    char text[TEXT_BUF_SIZE] = {0};
-    size_t text_len = 0;
-    if (entries && count > 0) {
-        for (size_t i = 0; i < count; i++) {
-            int written = snprintf(text + text_len, sizeof(text) - text_len,
-                                   "%s:%s:%s\n",
-                                   entries[i].service,
-                                   entries[i].username,
-                                   entries[i].password);
-            if (written > 0 && (size_t)written < sizeof(text) - text_len) {
-                text_len += (size_t)written;
-            }
-        }
-    }
-
-    // Authenticated encryption (AEAD): provides confidentiality via XChaCha20
-    // and integrity/authenticity verification via a 16-byte Poly1305 MAC tag.
-    size_t cipher_len = text_len + crypto_secretbox_MACBYTES;
-    unsigned char *ciphertext = malloc(cipher_len);
-    if (!ciphertext) {
-        wipe_buffer(text, sizeof(text));
+    // Derive key from password and wipe key buffer on failure.
+    if (derive_key(master_password, salt, key) != 0) {
         wipe_buffer(key, sizeof(key));
         return -1;
     }
 
-    crypto_secretbox_easy(ciphertext, (unsigned char *)text, text_len, nonce, key);
-    wipe_buffer(text, sizeof(text));
+    // Encrypt all entries with XChaCha20-Poly1305.
+    size_t plain_len = count * sizeof(Credential);
+    static const unsigned char empty = 0;
+    const unsigned char *plain = count ? (const unsigned char *)entries : &empty;
+    int encrypted = crypto_aead_xchacha20poly1305_ietf_encrypt(
+        cipher, &cipher_len, plain, plain_len, NULL, 0, NULL, nonce, key);
+
+    // Erase the encryption key from RAM immediately after encryption.
     wipe_buffer(key, sizeof(key));
 
-    // O_NOFOLLOW prevents symlink traversal attacks targeting arbitrary files.
-    // File mode 0600 restricts read and write permissions to the file owner only.
-    fd = open(VAULT_FILE, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
-    if (fd < 0) {
-        free(ciphertext);
+    // Check if encryption succeeded.
+    if (encrypted != 0 || cipher_len != plain_len + crypto_aead_xchacha20poly1305_ietf_ABYTES) {
+        wipe_buffer(cipher, sizeof(cipher));
         return -1;
     }
+
+    // Write to a temporary file first, so old data is safe if writing is interrupted.
+    char temp[] = VAULT_FILE ".XXXXXX";
+    int fd = mkstemp(temp);
+    if (fd < 0) { wipe_buffer(cipher, sizeof(cipher)); return -1; }
+
+    // Set file permissions to 0600 so only the file owner can read or write it.
     fchmod(fd, 0600);
 
-    // On-disk layout: [salt 16B] [nonce 24B] [ciphertext + MAC tag]
-    if (write(fd, salt, sizeof(salt)) != sizeof(salt) ||
-        write(fd, nonce, sizeof(nonce)) != sizeof(nonce) ||
-        write(fd, ciphertext, cipher_len) != (ssize_t)cipher_len) {
-        free(ciphertext);
-        close(fd);
-        return -1;
-    }
+    // Write header (salt + nonce) and encrypted data, then force to disk with fsync.
+    int ok = write_all(fd, salt, sizeof(salt)) == 0 &&
+             write_all(fd, nonce, sizeof(nonce)) == 0 &&
+             write_all(fd, cipher, (size_t)cipher_len) == 0 &&
+             fsync(fd) == 0;
 
-    free(ciphertext);
-    close(fd);
-    return 0;
+    if (close(fd) != 0) ok = 0;
+
+    // Safely replace the old vault file with the new temporary file.
+    if (ok && rename(temp, VAULT_FILE) != 0) ok = 0;
+
+    // If writing failed, delete the temporary file.
+    if (!ok) unlink(temp);
+
+    // Clear encrypted buffer from RAM.
+    wipe_buffer(cipher, sizeof(cipher));
+    return ok ? 0 : -1;
 }
 
-int vault_load(const char *master_password, Credential *entries,
-               size_t *count_out) {
-    if (!master_password || master_password[0] == '\0') return -1;
-    if (!entries || !count_out) return -1;
+// Open the vault file, authenticate the data, and decrypt all entries.
+int vault_load(const char *master_password, Credential *entries, size_t *count_out) {
+    // Validate input arguments.
+    if (!master_password || !master_password[0] || !entries || !count_out) return -1;
     *count_out = 0;
 
+    // Open file. O_NOFOLLOW stops attackers from using symlinks to steal other files.
     int fd = open(VAULT_FILE, O_RDONLY | O_NOFOLLOW);
     if (fd < 0) return -1;
 
-    // Validate minimum file size: file must contain salt, nonce, and Poly1305 MAC tag.
+    // Check file stats: must be a regular file, and size must be within valid bounds.
     struct stat st;
-    size_t header_size = crypto_pwhash_SALTBYTES + crypto_secretbox_NONCEBYTES;
-    if (fstat(fd, &st) != 0 ||
-        st.st_size < (off_t)(header_size + crypto_secretbox_MACBYTES)) {
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_size < (off_t)(HEADER_SIZE + crypto_aead_xchacha20poly1305_ietf_ABYTES) ||
+        st.st_size > (off_t)(HEADER_SIZE + MAX_CIPHER_SIZE)) {
         close(fd);
         return -1;
     }
 
     unsigned char salt[crypto_pwhash_SALTBYTES];
-    unsigned char nonce[crypto_secretbox_NONCEBYTES];
-    if (read(fd, salt, sizeof(salt)) != sizeof(salt) ||
-        read(fd, nonce, sizeof(nonce)) != sizeof(nonce)) {
-        close(fd);
-        return -1;
-    }
+    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+    unsigned char cipher[MAX_CIPHER_SIZE];
 
-    size_t cipher_len = (size_t)st.st_size - header_size;
-    unsigned char *ciphertext = malloc(cipher_len);
-    if (!ciphertext) {
-        close(fd);
-        return -1;
-    }
+    // Compute expected lengths for encrypted data and plaintext.
+    size_t cipher_len = (size_t)st.st_size - HEADER_SIZE;
+    size_t plain_len = cipher_len - crypto_aead_xchacha20poly1305_ietf_ABYTES;
 
-    if (read(fd, ciphertext, cipher_len) != (ssize_t)cipher_len) {
-        free(ciphertext);
+    // Read salt, nonce, and ciphertext from the file.
+    if (plain_len % sizeof(Credential) != 0 ||
+        read_all(fd, salt, sizeof(salt)) != 0 ||
+        read_all(fd, nonce, sizeof(nonce)) != 0 ||
+        read_all(fd, cipher, cipher_len) != 0) {
         close(fd);
         return -1;
     }
     close(fd);
 
-    unsigned char key[crypto_secretbox_KEYBYTES];
-    if (make_key(master_password, salt, key) != 0) {
-        free(ciphertext);
-        return -1;
-    }
-
-    // Authentication check: Poly1305 MAC verification occurs during decryption.
-    // Incorrect keys or modified ciphertexts cause immediate rejection without output.
-    size_t plain_len = cipher_len - crypto_secretbox_MACBYTES;
-    char *text = malloc(plain_len + 1);
-    if (!text) {
+    // Derive key using the password and the salt read from the file.
+    unsigned char key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
+    if (derive_key(master_password, salt, key) != 0) {
         wipe_buffer(key, sizeof(key));
-        free(ciphertext);
+        wipe_buffer(cipher, sizeof(cipher));
         return -1;
     }
 
-    if (crypto_secretbox_open_easy((unsigned char *)text, ciphertext,
-                                   cipher_len, nonce, key) != 0) {
-        wipe_buffer(key, sizeof(key));
-        free(ciphertext);
-        free(text);
-        return -1;
-    }
+    // Decrypt data and verify authentication tag. Fails if password is wrong or file was changed.
+    unsigned long long opened_len = 0;
+    int opened = crypto_aead_xchacha20poly1305_ietf_decrypt(
+        (unsigned char *)entries, &opened_len, NULL, cipher, cipher_len, NULL, 0, nonce, key);
 
+    // Wipe decryption key and ciphertext buffer from RAM immediately.
     wipe_buffer(key, sizeof(key));
-    free(ciphertext);
-    text[plain_len] = '\0';
+    wipe_buffer(cipher, sizeof(cipher));
 
-    // Parse records into credential structures
-    const char *line_start = text;
-    while (*line_start != '\0' && *count_out < MAX_ENTRIES) {
-        const char *line_end = strchr(line_start, '\n');
-        size_t line_len = line_end ? (size_t)(line_end - line_start)
-                                   : strlen(line_start);
-
-        char line[STR_LEN * 2 + PASS_LEN + 10];
-        if (line_len < sizeof(line)) {
-            memcpy(line, line_start, line_len);
-            line[line_len] = '\0';
-
-            char *c1 = strchr(line, ':');
-            if (c1) {
-                *c1 = '\0';
-                char *c2 = strchr(c1 + 1, ':');
-                if (c2) {
-                    *c2 = '\0';
-
-                    strncpy(entries[*count_out].service, line, STR_LEN - 1);
-                    entries[*count_out].service[STR_LEN - 1] = '\0';
-
-                    strncpy(entries[*count_out].username, c1 + 1, STR_LEN - 1);
-                    entries[*count_out].username[STR_LEN - 1] = '\0';
-
-                    strncpy(entries[*count_out].password, c2 + 1, PASS_LEN - 1);
-                    entries[*count_out].password[PASS_LEN - 1] = '\0';
-
-                    (*count_out)++;
-                }
-            }
-            wipe_buffer(line, sizeof(line));
-        }
-
-        if (!line_end) break;
-        line_start = line_end + 1;
+    // Check if decryption succeeded.
+    if (opened != 0 || opened_len != plain_len) {
+        wipe_buffer(entries, MAX_ENTRIES * sizeof(*entries));
+        return -1;
     }
 
-    wipe_buffer(text, plain_len);
-    free(text);
+    // Calculate number of loaded entries and validate all record strings.
+    *count_out = plain_len / sizeof(Credential);
+    for (size_t i = 0; i < *count_out; i++) {
+        if (!valid_record(&entries[i])) {
+            wipe_buffer(entries, MAX_ENTRIES * sizeof(*entries));
+            *count_out = 0;
+            return -1;
+        }
+    }
     return 0;
 }

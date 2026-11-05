@@ -1,73 +1,150 @@
+#define _POSIX_C_SOURCE 200809L
+#include "vault.h"
+
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/stat.h>
 #include <sodium.h>
-#include "vault.h"
 
-// Test harness for crypto engine and vault storage functionality.
-int main(void) {
-    // Restrict file creation permissions to owner only (0600/0700).
-    umask(0077);
-
-    // Initialize libsodium RNG and cryptographic primitives.
-    if (sodium_init() < 0) {
-        fprintf(stderr, "Fatal error: Could not initialize libsodium.\n");
-        return 1;
+// Check that service name only has normal printable characters.
+static int valid_service(const char *service) {
+    size_t len = strlen(service);
+    if (!len || len >= STR_LEN) return 0;
+    for (size_t i = 0; i < len; i++) {
+        if (!isprint((unsigned char)service[i])) return 0;
     }
+    return 1;
+}
 
-    printf("=== Secure Password Manager (SPM) - Engine Test ===\n\n");
-
-    // Sample credentials for storage and retrieval verification.
-    const char *test_pass = "MasterSecret123!";
-    Credential test_items[2];
-    snprintf(test_items[0].service, STR_LEN, "github.com");
-    snprintf(test_items[0].username, STR_LEN, "alice");
-    snprintf(test_items[0].password, PASS_LEN, "GithubPass#2026");
-
-    snprintf(test_items[1].service, STR_LEN, "taltech.ee");
-    snprintf(test_items[1].username, STR_LEN, "alice@taltech.ee");
-    snprintf(test_items[1].password, PASS_LEN, "StudentPortalPass!");
-
-    // Test encrypted write operation.
-    printf("1. Encrypting and saving 2 test credentials to '%s'...\n", VAULT_FILE);
-    if (vault_save(test_pass, test_items, 2) != 0) {
-        fprintf(stderr, "Error: Failed to save encrypted vault.\n");
-        return 1;
-    }
-    printf("   [+] Vault saved and encrypted successfully at rest.\n\n");
-
-    // Test decryption with valid credentials.
-    printf("2. Testing decryption with correct master password...\n");
-    Credential loaded_items[MAX_ENTRIES];
-    size_t count = 0;
-    if (vault_load(test_pass, loaded_items, &count) != 0) {
-        fprintf(stderr, "Error: Decryption failed with correct password.\n");
-        return 1;
-    }
-    printf("   [+] Decryption succeeded! Loaded %zu credentials:\n", count);
+// Search for an existing entry matching the given service name.
+static int find_service(const Credential *entries, size_t count, const char *service) {
     for (size_t i = 0; i < count; i++) {
-        printf("       [%zu] %s (user: %s)\n",
-               i + 1, loaded_items[i].service, loaded_items[i].username);
+        if (strcmp(entries[i].service, service) == 0) return (int)i;
     }
-    printf("       (Passwords kept secret in memory).\n\n");
+    return -1;
+}
 
-    // Test tampering and invalid password rejection via Poly1305 MAC verification.
-    printf("3. Testing tamper & wrong-password defense...\n");
-    Credential fake_items[MAX_ENTRIES];
-    size_t fake_count = 0;
-    if (vault_load("WrongPassword!", fake_items, &fake_count) == 0) {
-        fprintf(stderr, "Error: Security failure! Vault unlocked with wrong password!\n");
+// Print command help and how to use the program.
+static void usage(const char *program) {
+    printf("Usage: %s <init|add|list> [service]\n"
+           "  init          Create the vault\n"
+           "  add <service> Add or update an entry\n"
+           "  list          Show saved services and usernames\n", program);
+}
+
+int main(int argc, char **argv) {
+    // Start up libsodium security library.
+    if (sodium_init() < 0) {
+        fputs("Secure storage is unavailable.\n", stderr);
         return 1;
     }
-    printf("   [+] Poly1305 MAC tag rejected wrong password successfully.\n\n");
 
-    // Clean up test file and zero memory buffers.
-    unlink(VAULT_FILE);
-    wipe_buffer(test_items, sizeof(test_items));
-    wipe_buffer(loaded_items, sizeof(loaded_items));
+    // Check if user provided too few arguments.
+    if (argc < 2) {
+        usage(argv[0]);
+        return 1;
+    }
 
-    printf("All core engine security checks passed.\n");
-    return 0;
+    // Check which command was requested.
+    const char *command = argv[1];
+    int is_init = strcmp(command, "init") == 0;
+    int is_list = strcmp(command, "list") == 0;
+    int is_add = strcmp(command, "add") == 0;
+
+    // Validate command name and argument count.
+    if (!is_init && !is_list && !is_add) {
+        usage(argv[0]);
+        return 1;
+    }
+    if ((is_init || is_list) && argc != 2) {
+        usage(argv[0]);
+        return 1;
+    }
+    if (is_add && (argc != 3 || !valid_service(argv[2]))) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    // On init, stop if vault.bin already exists so we do not overwrite data.
+    struct stat st;
+    if (is_init && lstat(VAULT_FILE, &st) == 0) {
+        fputs("A vault already exists.\n", stderr);
+        return 1;
+    }
+
+    // Buffers to hold master password and loaded entries.
+    char master[PASS_LEN] = {0};
+    Credential entries[MAX_ENTRIES] = {0};
+    size_t count = 0;
+    int status = 1;
+
+    // Ask user for master password without showing it on screen.
+    if (prompt_input("Master password: ", master, sizeof(master), 1) != 0 || !master[0]) {
+        fputs("Invalid password input.\n", stderr);
+        goto done;
+    }
+
+    // Handle init command: save an empty vault.
+    if (is_init) {
+        if (vault_save(master, NULL, 0) != 0) {
+            fputs("Could not create the vault.\n", stderr);
+            goto done;
+        }
+        puts("Vault created.");
+        status = 0;
+        goto done;
+    }
+
+    // Load and decrypt vault with master password. Fails on wrong password or bad file.
+    if (vault_load(master, entries, &count) != 0) {
+        fputs("Could not unlock the vault.\n", stderr);
+        goto done;
+    }
+
+    // Handle list command: show services and usernames, never passwords.
+    if (is_list) {
+        for (size_t i = 0; i < count; i++) {
+            printf("%s (user: %s)\n", entries[i].service, entries[i].username);
+        }
+        if (!count) puts("Vault is empty.");
+        status = 0;
+    }
+    // Handle add command: insert new entry or update existing one.
+    else if (is_add) {
+        int index = find_service(entries, count, argv[2]);
+        // If entry is new, check if vault reached max limit.
+        if (index < 0) {
+            if (count == MAX_ENTRIES) {
+                fputs("Vault is full.\n", stderr);
+                goto done;
+            }
+            index = (int)count++;
+        }
+        // Ask for username in plain text, password hidden.
+        if (prompt_input("Username: ", entries[index].username, STR_LEN, 0) != 0 ||
+            !entries[index].username[0] ||
+            prompt_input("Password: ", entries[index].password, PASS_LEN, 1) != 0 ||
+            !entries[index].password[0]) {
+            fputs("Invalid entry input.\n", stderr);
+            goto done;
+        }
+        // Save service name into entry.
+        snprintf(entries[index].service, STR_LEN, "%s", argv[2]);
+
+        // Encrypt and write updated vault to disk.
+        if (vault_save(master, entries, count) != 0) {
+            fputs("Could not save the vault.\n", stderr);
+            goto done;
+        }
+        puts("Entry saved.");
+        status = 0;
+    }
+
+done:
+    // Wipe sensitive password and entry buffers from RAM before exiting.
+    wipe_buffer(master, sizeof(master));
+    wipe_buffer(entries, sizeof(entries));
+    return status;
 }
