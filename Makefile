@@ -21,6 +21,6 @@ $(BIN): $(OBJS)
 	$(CC) $(OBJS) -o $(BIN) $(LDFLAGS)
 
 clean:
-	rm -rf $(OBJ_DIR) $(BIN) vault.bin
+	rm -rf $(OBJ_DIR) $(BIN)
 
 .PHONY: all clean

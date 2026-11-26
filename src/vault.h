@@ -15,7 +15,13 @@ typedef struct {
     char password[PASS_LEN];
 } Credential;
 
-// Read user input. Hides typing if hidden is 1.
+// Install handlers for SIGINT, SIGTERM, and SIGHUP, and ignore SIGTSTP.
+void setup_signals(void);
+
+// Prompt or report pending signal exit. Returns 0 to continue or exit code (e.g. 130).
+int handle_pending_signals(void);
+
+// Read user input. Hides typing if hidden is 1. Returns 0, -1 (error/EOF), or -2 (signal).
 int prompt_input(const char *prompt, char *buffer, size_t size, int hidden);
 
 // Clear sensitive data from memory.

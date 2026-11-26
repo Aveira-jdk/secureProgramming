@@ -49,8 +49,13 @@ static int copy_to_clipboard(const char *password) {
 }
 
 // Print command help and how to use the program.
-static void usage(const char *program) {
-    printf("Usage: %s <init|add|list|get|del|help> [service]\n"
+static void usage(const char *program, int interactive) {
+    if (interactive) {
+        puts("Commands: init | add <service> | list | get <service> | del <service> | help | exit | quit");
+        return;
+    }
+    printf("Usage: %s [init|add|list|get|del|help] [service]\n"
+           "  (no args)     Start interactive session\n"
            "  init          Create the vault\n"
            "  add <service> Add or update an entry\n"
            "  list          Show saved services and usernames\n"
@@ -59,149 +64,291 @@ static void usage(const char *program) {
            "  help          Show this help text\n", program);
 }
 
-int main(int argc, char **argv) {
-    // Start up libsodium security library.
-    if (sodium_init() < 0) {
-        fputs("Secure storage is unavailable.\n", stderr);
-        return 1;
+// Unlock the vault if it is not already unlocked in memory.
+static int ensure_unlocked(char *master, size_t master_sz, Credential *entries,
+                           size_t *count, int *unlocked) {
+    if (*unlocked) return 0;
+
+    int rc = prompt_input("Master password: ", master, master_sz, 1);
+    if (rc == -2) return -2;
+    if (rc != 0 || !master[0]) {
+        fputs("Invalid password input.\n", stderr);
+        return -1;
     }
 
-    // Check if user asked for help.
-    if (argc < 2 || strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0) {
-        usage(argv[0]);
-        return argc < 2 ? 1 : 0;
+    if (vault_load(master, entries, count) != 0) {
+        wipe_buffer(master, master_sz);
+        if (handle_pending_signals() != 0) return -2;
+        fputs("Could not unlock the vault.\n", stderr);
+        return -1;
     }
+    if (handle_pending_signals() != 0) return -2;
+    *unlocked = 1;
+    return 0;
+}
 
-    // Check which command was requested.
-    const char *command = argv[1];
+// Execute one command. Returns 0 on success, -1 on runtime error, -2 on signal abort, -3 on bad syntax.
+static int run_command(const char *command, const char *arg, char *master, size_t master_sz,
+                       Credential *entries, size_t *count, int *unlocked) {
     int is_init = strcmp(command, "init") == 0;
     int is_list = strcmp(command, "list") == 0;
     int is_add = strcmp(command, "add") == 0;
     int is_get = strcmp(command, "get") == 0;
     int is_del = strcmp(command, "del") == 0;
 
-    // Validate command name and argument count.
-    if (!is_init && !is_list && !is_add && !is_get && !is_del) {
-        usage(argv[0]);
-        return 1;
-    }
-    if ((is_init || is_list) && argc != 2) {
-        usage(argv[0]);
-        return 1;
-    }
-    if ((is_add || is_get || is_del) && (argc != 3 || !valid_service(argv[2]))) {
-        usage(argv[0]);
-        return 1;
-    }
+    if (!is_init && !is_list && !is_add && !is_get && !is_del) return -3;
+    if ((is_init || is_list) && arg != NULL) return -3;
+    if ((is_add || is_get || is_del) && (arg == NULL || !valid_service(arg))) return -3;
 
     // On init, stop if vault.bin already exists so we do not overwrite data.
-    struct stat st;
-    if (is_init && lstat(VAULT_FILE, &st) == 0) {
-        fputs("A vault already exists.\n", stderr);
-        return 1;
-    }
-
-    // Buffers to hold master password and loaded entries.
-    char master[PASS_LEN] = {0};
-    Credential entries[MAX_ENTRIES] = {0};
-    size_t count = 0;
-    int status = 1;
-
-    // Ask user for master password without showing it on screen.
-    if (prompt_input("Master password: ", master, sizeof(master), 1) != 0 || !master[0]) {
-        fputs("Invalid password input.\n", stderr);
-        goto done;
-    }
-
-    // Handle init command: save an empty vault.
     if (is_init) {
-        if (vault_save(master, NULL, 0) != 0) {
-            fputs("Could not create the vault.\n", stderr);
-            goto done;
+        struct stat st;
+        if (lstat(VAULT_FILE, &st) == 0) {
+            fputs("A vault already exists.\n", stderr);
+            return -1;
         }
+        char new_master[PASS_LEN] = {0};
+        int rc = prompt_input("Master password: ", new_master, sizeof(new_master), 1);
+        if (rc == -2) { wipe_buffer(new_master, sizeof(new_master)); return -2; }
+        if (rc != 0 || !new_master[0]) {
+            wipe_buffer(new_master, sizeof(new_master));
+            fputs("Invalid password input.\n", stderr);
+            return -1;
+        }
+        if (vault_save(new_master, NULL, 0) != 0) {
+            wipe_buffer(new_master, sizeof(new_master));
+            fputs("Could not create the vault.\n", stderr);
+            return -1;
+        }
+        wipe_buffer(entries, MAX_ENTRIES * sizeof(*entries));
+        memcpy(master, new_master, master_sz);
+        wipe_buffer(new_master, sizeof(new_master));
+        *count = 0;
+        *unlocked = 1;
         puts("Vault created.");
-        status = 0;
-        goto done;
+        return handle_pending_signals() != 0 ? -2 : 0;
     }
 
-    // Load and decrypt vault with master password. Fails on wrong password or bad file.
-    if (vault_load(master, entries, &count) != 0) {
-        fputs("Could not unlock the vault.\n", stderr);
-        goto done;
-    }
+    int unlock_rc = ensure_unlocked(master, master_sz, entries, count, unlocked);
+    if (unlock_rc != 0) return unlock_rc;
 
-    // Handle list command: show services and usernames, never passwords.
     if (is_list) {
-        for (size_t i = 0; i < count; i++) {
+        for (size_t i = 0; i < *count; i++) {
             printf("%s (user: %s)\n", entries[i].service, entries[i].username);
         }
-        if (!count) puts("Vault is empty.");
-        status = 0;
+        if (!*count) puts("Vault is empty.");
+        return 0;
     }
-    // Handle add command: insert new entry or update existing one.
-    else if (is_add) {
-        int index = find_service(entries, count, argv[2]);
-        // If entry is new, check if vault reached max limit.
-        if (index < 0) {
-            if (count == MAX_ENTRIES) {
-                fputs("Vault is full.\n", stderr);
-                goto done;
-            }
-            index = (int)count++;
-        }
-        // Ask for username in plain text, password hidden.
-        if (prompt_input("Username: ", entries[index].username, STR_LEN, 0) != 0 ||
-            !entries[index].username[0] ||
-            prompt_input("Password: ", entries[index].password, PASS_LEN, 1) != 0 ||
-            !entries[index].password[0]) {
-            fputs("Invalid entry input.\n", stderr);
-            goto done;
-        }
-        // Save service name into entry.
-        snprintf(entries[index].service, STR_LEN, "%s", argv[2]);
 
-        // Encrypt and write updated vault to disk.
-        if (vault_save(master, entries, count) != 0) {
-            fputs("Could not save the vault.\n", stderr);
-            goto done;
+    if (is_add) {
+        int index = find_service(entries, *count, arg);
+        int is_new = index < 0;
+        if (is_new && *count == MAX_ENTRIES) {
+            fputs("Vault is full.\n", stderr);
+            return -1;
         }
+
+        char user_buf[STR_LEN] = {0};
+        char pass_buf[PASS_LEN] = {0};
+        int rc = prompt_input("Username: ", user_buf, sizeof(user_buf), 0);
+        if (rc == -2) { wipe_buffer(user_buf, sizeof(user_buf)); return -2; }
+        if (rc != 0 || !user_buf[0]) {
+            wipe_buffer(user_buf, sizeof(user_buf));
+            fputs("Invalid entry input.\n", stderr);
+            return -1;
+        }
+
+        rc = prompt_input("Password: ", pass_buf, sizeof(pass_buf), 1);
+        if (rc == -2) {
+            wipe_buffer(user_buf, sizeof(user_buf));
+            wipe_buffer(pass_buf, sizeof(pass_buf));
+            return -2;
+        }
+        if (rc != 0 || !pass_buf[0]) {
+            wipe_buffer(user_buf, sizeof(user_buf));
+            wipe_buffer(pass_buf, sizeof(pass_buf));
+            fputs("Invalid entry input.\n", stderr);
+            return -1;
+        }
+
+        Credential backup = {0};
+        size_t target = is_new ? (*count)++ : (size_t)index;
+        if (!is_new) backup = entries[target];
+
+        snprintf(entries[target].service, STR_LEN, "%s", arg);
+        snprintf(entries[target].username, STR_LEN, "%s", user_buf);
+        snprintf(entries[target].password, PASS_LEN, "%s", pass_buf);
+        wipe_buffer(user_buf, sizeof(user_buf));
+        wipe_buffer(pass_buf, sizeof(pass_buf));
+
+        if (vault_save(master, entries, *count) != 0) {
+            if (is_new) wipe_buffer(&entries[--(*count)], sizeof(entries[0]));
+            else entries[target] = backup;
+            wipe_buffer(&backup, sizeof(backup));
+            fputs("Could not save the vault.\n", stderr);
+            return -1;
+        }
+        wipe_buffer(&backup, sizeof(backup));
         puts("Entry saved.");
-        status = 0;
+        return handle_pending_signals() != 0 ? -2 : 0;
     }
-    // Handle get: copy password to clipboard.
-    else if (is_get) {
-        int index = find_service(entries, count, argv[2]);
+
+    if (is_get) {
+        int index = find_service(entries, *count, arg);
         if (index < 0) {
             fputs("Entry not found.\n", stderr);
-            goto done;
+            return -1;
         }
         if (copy_to_clipboard(entries[index].password) != 0) {
             fputs("Could not copy to clipboard.\n", stderr);
-            goto done;
+            return -1;
         }
         puts("Clipboard helper started.");
-        status = 0;
+        return 0;
     }
-    // Handle del: remove entry and shift remaining ones left.
-    else if (is_del) {
-        int index = find_service(entries, count, argv[2]);
-        if (index < 0) {
-            fputs("Entry not found.\n", stderr);
-            goto done;
-        }
-        for (size_t i = (size_t)index + 1; i < count; i++) {
-            entries[i - 1] = entries[i];
-        }
-        // Wipe the last slot that is now unused.
-        wipe_buffer(&entries[--count], sizeof(entries[0]));
 
-        // Save updated vault to disk.
-        if (vault_save(master, entries, count) != 0) {
-            fputs("Could not save the vault.\n", stderr);
+    // is_del
+    int index = find_service(entries, *count, arg);
+    if (index < 0) {
+        fputs("Entry not found.\n", stderr);
+        return -1;
+    }
+    Credential backup = entries[index];
+    for (size_t i = (size_t)index + 1; i < *count; i++) {
+        entries[i - 1] = entries[i];
+    }
+    wipe_buffer(&entries[--(*count)], sizeof(entries[0]));
+
+    if (vault_save(master, entries, *count) != 0) {
+        for (size_t i = *count; i > (size_t)index; i--) {
+            entries[i] = entries[i - 1];
+        }
+        entries[index] = backup;
+        (*count)++;
+        wipe_buffer(&backup, sizeof(backup));
+        fputs("Could not save the vault.\n", stderr);
+        return -1;
+    }
+    wipe_buffer(&backup, sizeof(backup));
+    puts("Entry deleted.");
+    return handle_pending_signals() != 0 ? -2 : 0;
+}
+
+int main(int argc, char **argv) {
+    // Start up libsodium security library.
+    if (sodium_init() < 0) {
+        fputs("Secure storage is unavailable.\n", stderr);
+        return 1;
+    }
+    setup_signals();
+
+    if (argc < 1) { usage("spm", 0); return 1; }
+    const char *prog = argv[0] ? argv[0] : "spm";
+
+    // Handle explicit help flag.
+    if (argc >= 2 && (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0)) {
+        usage(prog, 0);
+        return 0;
+    }
+
+    char master[PASS_LEN] = {0};
+    Credential entries[MAX_ENTRIES] = {0};
+    size_t count = 0;
+    int unlocked = 0;
+    int status = 1;
+
+    // One-shot CLI mode when command-line arguments are supplied.
+    if (argc >= 2) {
+        if (argc > 3) {
+            usage(prog, 0);
             goto done;
         }
-        puts("Entry deleted.");
-        status = 0;
+        const char *arg = (argc == 3) ? argv[2] : NULL;
+        int rc = run_command(argv[1], arg, master, sizeof(master), entries, &count, &unlocked);
+        if (rc == -3) {
+            usage(prog, 0);
+            goto done;
+        }
+        if (rc == -2) {
+            status = handle_pending_signals();
+            if (status == 0) status = 130;
+            goto done;
+        }
+        status = (rc == 0) ? 0 : 1;
+        goto done;
+    }
+
+    // Interactive mode when started with no arguments.
+    puts("Interactive mode. Type 'help' or 'exit'.");
+    for (;;) {
+        int sig_rc = handle_pending_signals();
+        if (sig_rc != 0) { status = sig_rc; goto done; }
+
+        char line[256] = {0};
+        int rc = prompt_input("spm> ", line, sizeof(line), 0);
+        if (rc == -2) {
+            wipe_buffer(line, sizeof(line));
+            status = handle_pending_signals();
+            if (status == 0) status = 130;
+            goto done;
+        }
+        if (rc != 0) {
+            wipe_buffer(line, sizeof(line));
+            if (feof(stdin) && !ferror(stdin)) {
+                fputc('\n', stdout);
+                status = 0;
+                goto done;
+            }
+            fputs("Invalid command input.\n", stderr);
+            continue;
+        }
+
+        // Parse up to 2 whitespace-separated tokens without allocating.
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') continue;
+
+        char *cmd = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) *p++ = '\0';
+        while (*p == ' ' || *p == '\t') p++;
+
+        char *arg = (*p != '\0') ? p : NULL;
+        if (arg) {
+            while (*p && *p != ' ' && *p != '\t') p++;
+            if (*p) {
+                *p++ = '\0';
+                while (*p == ' ' || *p == '\t') p++;
+                if (*p != '\0') {
+                    wipe_buffer(line, sizeof(line));
+                    usage(prog, 1);
+                    continue;
+                }
+            }
+        }
+
+        if ((strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) && !arg) {
+            wipe_buffer(line, sizeof(line));
+            status = 0;
+            goto done;
+        }
+        if ((strcmp(cmd, "help") == 0 || strcmp(cmd, "--help") == 0) && !arg) {
+            wipe_buffer(line, sizeof(line));
+            usage(prog, 1);
+            continue;
+        }
+
+        int cmd_rc = run_command(cmd, arg, master, sizeof(master), entries, &count, &unlocked);
+        wipe_buffer(line, sizeof(line));
+        if (cmd_rc == -2) {
+            status = handle_pending_signals();
+            if (status == 0) status = 130;
+            goto done;
+        }
+        if (cmd_rc == -3) usage(prog, 1);
+
+        sig_rc = handle_pending_signals();
+        if (sig_rc != 0) { status = sig_rc; goto done; }
     }
 
 done:

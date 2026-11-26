@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,86 @@
 // Maximum encrypted size: 50 entries plus 16-byte authentication tag.
 #define MAX_CIPHER_SIZE (MAX_ENTRIES * sizeof(Credential) + crypto_aead_xchacha20poly1305_ietf_ABYTES)
 
+static volatile sig_atomic_t g_got_sigint = 0;
+static volatile sig_atomic_t g_term_sig = 0;
+static volatile sig_atomic_t g_in_confirm = 0;
+static volatile sig_atomic_t g_term_active = 0;
+static struct termios g_saved_term;
+
+static void signal_handler(int sig) {
+    int saved_errno = errno;
+    if (g_term_active) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_term);
+    }
+    if (sig == SIGINT) {
+        if (g_in_confirm) g_term_sig = SIGINT;
+        else g_got_sigint = 1;
+    } else {
+        g_term_sig = sig;
+    }
+    errno = saved_errno;
+}
+
+void setup_signals(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+
+    // Ignore Ctrl+Z so unlocked secrets cannot be suspended in RAM or leave ECHO off.
+    sa.sa_handler = SIG_IGN;
+    sigaction(SIGTSTP, &sa, NULL);
+}
+
+static int confirm_sigint_exit(void) {
+    g_in_confirm = 1;
+    for (;;) {
+        g_got_sigint = 0;
+        clearerr(stdin);
+        fputs("\nExit cleanly? [y/N]: ", stdout);
+        fflush(stdout);
+
+        char ans[16] = {0};
+        if (!fgets(ans, (int)sizeof(ans), stdin)) {
+            g_in_confirm = 0;
+            fputc('\n', stdout);
+            if (!g_term_sig) g_term_sig = SIGINT;
+            return 1;
+        }
+
+        size_t len = strlen(ans);
+        if (len && ans[len - 1] == '\n') {
+            ans[--len] = '\0';
+        } else if (!feof(stdin)) {
+            int ch;
+            while ((ch = getchar()) != '\n' && ch != EOF) {}
+            clearerr(stdin);
+            continue;
+        }
+
+        if ((ans[0] == 'y' || ans[0] == 'Y') && len == 1) {
+            g_in_confirm = 0;
+            g_term_sig = SIGINT;
+            return 1;
+        }
+        if (len == 0 || ((ans[0] == 'n' || ans[0] == 'N') && len == 1)) {
+            g_in_confirm = 0;
+            clearerr(stdin);
+            return 0;
+        }
+    }
+}
+
+int handle_pending_signals(void) {
+    if (g_term_sig) return 128 + (int)g_term_sig;
+    if (g_got_sigint && confirm_sigint_exit()) return 128 + (int)g_term_sig;
+    return 0;
+}
+
 // Overwrite memory with zeros so secrets do not stay in RAM.
 void wipe_buffer(void *ptr, size_t size) {
     if (ptr && size) sodium_memzero(ptr, size);
@@ -26,47 +107,77 @@ void wipe_buffer(void *ptr, size_t size) {
 int prompt_input(const char *prompt, char *buffer, size_t size, int hidden) {
     // Check that buffer pointer and size are valid.
     if (!buffer || size < 2 || size > INT_MAX) return -1;
-
-    // Show prompt to the user.
-    if (prompt) { fputs(prompt, stdout); fflush(stdout); }
+    if (handle_pending_signals() != 0) return -2;
 
     struct termios old_term;
-    int changed = 0;
+    int term_tty = hidden && isatty(STDIN_FILENO);
 
-    // Turn off terminal echo if input is a secret password.
-    if (hidden && isatty(STDIN_FILENO)) {
-        if (tcgetattr(STDIN_FILENO, &old_term) != 0) return -1;
-        struct termios quiet_term = old_term;
-        quiet_term.c_lflag &= (tcflag_t)~ECHO;
-        if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &quiet_term) != 0) return -1;
-        changed = 1;
+    for (;;) {
+        int changed = 0;
+        // Turn off echo before printing prompt so fast typing neither echoes nor gets flushed.
+        if (term_tty) {
+            if (tcgetattr(STDIN_FILENO, &old_term) != 0) return -1;
+            g_saved_term = old_term;
+            g_term_active = 1;
+            struct termios quiet_term = old_term;
+            quiet_term.c_lflag &= (tcflag_t)~ECHO;
+            if (tcsetattr(STDIN_FILENO, TCSANOW, &quiet_term) != 0) {
+                g_term_active = 0;
+                return -1;
+            }
+            changed = 1;
+        }
+
+        // Show prompt to the user.
+        if (prompt) { fputs(prompt, stdout); fflush(stdout); }
+
+        // Read the line from stdin unless a signal already interrupted before fgets.
+        clearerr(stdin);
+        char *result = NULL;
+        if (!g_term_sig && !g_got_sigint) {
+            result = fgets(buffer, (int)size, stdin);
+        }
+
+        // Restore terminal settings immediately so typing works normally again.
+        if (changed) {
+            g_term_active = 0;
+            tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+        }
+
+        // Return error or ask confirmation on signal interrupt.
+        if (!result) {
+            wipe_buffer(buffer, size);
+            if (g_term_sig) return -2;
+            if (g_got_sigint) {
+                if (confirm_sigint_exit()) return -2;
+                continue;
+            }
+            if (changed) fputc('\n', stdout);
+            return -1;
+        }
+
+        if (changed) fputc('\n', stdout);
+        if (g_term_sig) { wipe_buffer(buffer, size); return -2; }
+        if (g_got_sigint) {
+            wipe_buffer(buffer, size);
+            if (confirm_sigint_exit()) return -2;
+            continue;
+        }
+
+        // Strip trailing newline character.
+        size_t len = strlen(buffer);
+        if (len && buffer[len - 1] == '\n') {
+            buffer[--len] = '\0';
+        }
+        // If input exceeded buffer size, clear extra characters to keep stdin clean.
+        else if (!feof(stdin)) {
+            int ch;
+            while ((ch = getchar()) != '\n' && ch != EOF) {}
+            wipe_buffer(buffer, size);
+            return -1;
+        }
+        return 0;
     }
-
-    // Read the line from stdin.
-    char *result = fgets(buffer, (int)size, stdin);
-
-    // Restore terminal settings so typing works normally again.
-    if (changed) {
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &old_term);
-        fputc('\n', stdout);
-    }
-
-    // Return error if reading failed.
-    if (!result) { wipe_buffer(buffer, size); return -1; }
-
-    // Strip trailing newline character.
-    size_t len = strlen(buffer);
-    if (len && buffer[len - 1] == '\n') {
-        buffer[--len] = '\0';
-    }
-    // If input exceeded buffer size, clear extra characters to keep stdin clean.
-    else if (!feof(stdin)) {
-        int ch;
-        while ((ch = getchar()) != '\n' && ch != EOF) {}
-        wipe_buffer(buffer, size);
-        return -1;
-    }
-    return 0;
 }
 
 // Keep reading until all requested bytes are read from the file.
@@ -162,8 +273,16 @@ int vault_save(const char *master_password, const Credential *entries, size_t co
     // Set file permissions to 0600 so only the file owner can read or write it.
     fchmod(fd, 0600);
 
+    // Block SIGINT and SIGTERM across write, fsync, close, and rename so the save completes atomically.
+    sigset_t block_set, old_set;
+    sigemptyset(&block_set);
+    sigaddset(&block_set, SIGINT);
+    sigaddset(&block_set, SIGTERM);
+    int blocked = sigprocmask(SIG_BLOCK, &block_set, &old_set) == 0;
+
     // Write header (salt + nonce) and encrypted data, then force to disk with fsync.
-    int ok = write_all(fd, salt, sizeof(salt)) == 0 &&
+    int ok = blocked &&
+             write_all(fd, salt, sizeof(salt)) == 0 &&
              write_all(fd, nonce, sizeof(nonce)) == 0 &&
              write_all(fd, cipher, (size_t)cipher_len) == 0 &&
              fsync(fd) == 0;
@@ -175,6 +294,8 @@ int vault_save(const char *master_password, const Credential *entries, size_t co
 
     // If writing failed, delete the temporary file.
     if (!ok) unlink(temp);
+
+    if (blocked) sigprocmask(SIG_SETMASK, &old_set, NULL);
 
     // Clear encrypted buffer from RAM.
     wipe_buffer(cipher, sizeof(cipher));
