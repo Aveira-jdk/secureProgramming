@@ -229,43 +229,54 @@ static int run_command(const char *command, const char *arg, char *master, size_
             fputs("A vault already exists.\n", stderr);
             return -1;
         }
-        char new_master[PASS_LEN] = {0};
-        int rc = prompt_input("Master password: ", new_master, sizeof(new_master), 1);
-        if (rc == -2) { wipe_buffer(new_master, sizeof(new_master)); return -2; }
+        char *new_master = secure_alloc(PASS_LEN);
+        if (!new_master) {
+            log_event("INIT", "FAIL", "memory_error");
+            fputs("Secure memory is unavailable.\n", stderr);
+            return -1;
+        }
+        int rc = prompt_input("Master password: ", new_master, PASS_LEN, 1);
+        if (rc == -2) { secure_free(new_master); return -2; }
         if (rc != 0 || !valid_password(new_master, MIN_MASTER_LEN)) {
-            wipe_buffer(new_master, sizeof(new_master));
+            secure_free(new_master);
             log_event("INIT", "FAIL", "invalid_input");
             fprintf(stderr, "Master password must be %d to %d normal characters.\n",
                     MIN_MASTER_LEN, PASS_LEN - 2);
             return -1;
         }
 
-        char confirm[PASS_LEN] = {0};
-        rc = prompt_input("Confirm master password: ", confirm, sizeof(confirm), 1);
+        char *confirm = secure_alloc(PASS_LEN);
+        if (!confirm) {
+            secure_free(new_master);
+            log_event("INIT", "FAIL", "memory_error");
+            fputs("Secure memory is unavailable.\n", stderr);
+            return -1;
+        }
+        rc = prompt_input("Confirm master password: ", confirm, PASS_LEN, 1);
         if (rc == -2) {
-            wipe_buffer(new_master, sizeof(new_master));
-            wipe_buffer(confirm, sizeof(confirm));
+            secure_free(new_master);
+            secure_free(confirm);
             return -2;
         }
         size_t mlen = strlen(new_master);
         int match = (rc == 0 && strlen(confirm) == mlen && sodium_memcmp(new_master, confirm, mlen) == 0);
-        wipe_buffer(confirm, sizeof(confirm));
+        secure_free(confirm);
         if (!match) {
-            wipe_buffer(new_master, sizeof(new_master));
+            secure_free(new_master);
             log_event("INIT", "FAIL", "password_mismatch");
             fputs("Master passwords do not match.\n", stderr);
             return -1;
         }
 
         if (vault_create(new_master) != 0) {
-            wipe_buffer(new_master, sizeof(new_master));
+            secure_free(new_master);
             log_event("INIT", "FAIL", "save_failed");
             fputs("Could not create the vault.\n", stderr);
             return -1;
         }
         wipe_buffer(entries, MAX_ENTRIES * sizeof(*entries));
         memcpy(master, new_master, master_sz);
-        wipe_buffer(new_master, sizeof(new_master));
+        secure_free(new_master);
         *count = 0;
         *unlocked = 1;
         log_event("INIT", "OK", "vault_created");
@@ -295,7 +306,6 @@ static int run_command(const char *command, const char *arg, char *master, size_
         }
 
         char user_buf[STR_LEN] = {0};
-        char pass_buf[PASS_LEN] = {0};
         int rc = prompt_input("Username: ", user_buf, sizeof(user_buf), 0);
         if (rc == -2) { wipe_buffer(user_buf, sizeof(user_buf)); return -2; }
         if (rc != 0 || !valid_ident(user_buf)) {
@@ -305,33 +315,47 @@ static int run_command(const char *command, const char *arg, char *master, size_
             return -1;
         }
 
-        rc = prompt_input("Password: ", pass_buf, sizeof(pass_buf), 1);
+        char *pass_buf = secure_alloc(PASS_LEN);
+        if (!pass_buf) {
+            wipe_buffer(user_buf, sizeof(user_buf));
+            log_event("ADD", "FAIL", "memory_error");
+            fputs("Secure memory is unavailable.\n", stderr);
+            return -1;
+        }
+        rc = prompt_input("Password: ", pass_buf, PASS_LEN, 1);
         if (rc == -2) {
             wipe_buffer(user_buf, sizeof(user_buf));
-            wipe_buffer(pass_buf, sizeof(pass_buf));
+            secure_free(pass_buf);
             return -2;
         }
         if (rc != 0 || !valid_password(pass_buf, 1)) {
             wipe_buffer(user_buf, sizeof(user_buf));
-            wipe_buffer(pass_buf, sizeof(pass_buf));
+            secure_free(pass_buf);
             log_event("ADD", "FAIL", "invalid_input");
             fputs("Invalid entry password.\n", stderr);
             return -1;
         }
 
-        Credential backup = {0};
+        Credential *backup = is_new ? NULL : secure_alloc(sizeof(Credential));
+        if (!is_new && !backup) {
+            wipe_buffer(user_buf, sizeof(user_buf));
+            secure_free(pass_buf);
+            log_event("ADD", "FAIL", "memory_error");
+            fputs("Secure memory is unavailable.\n", stderr);
+            return -1;
+        }
         size_t target = is_new ? (*count)++ : (size_t)index;
-        if (!is_new) backup = entries[target];
+        if (!is_new) *backup = entries[target];
 
         int n1 = snprintf(entries[target].service, STR_LEN, "%s", arg);
         int n2 = snprintf(entries[target].username, STR_LEN, "%s", user_buf);
         int n3 = snprintf(entries[target].password, PASS_LEN, "%s", pass_buf);
         wipe_buffer(user_buf, sizeof(user_buf));
-        wipe_buffer(pass_buf, sizeof(pass_buf));
+        secure_free(pass_buf);
         if (n1 <= 0 || n1 >= STR_LEN || n2 <= 0 || n2 >= STR_LEN || n3 <= 0 || n3 >= PASS_LEN) {
             if (is_new) wipe_buffer(&entries[--(*count)], sizeof(entries[0]));
-            else entries[target] = backup;
-            wipe_buffer(&backup, sizeof(backup));
+            else entries[target] = *backup;
+            secure_free(backup);
             log_event("ADD", "FAIL", "invalid_input");
             fputs("Invalid entry input.\n", stderr);
             return -1;
@@ -339,13 +363,13 @@ static int run_command(const char *command, const char *arg, char *master, size_
 
         if (vault_save(master, entries, *count) != 0) {
             if (is_new) wipe_buffer(&entries[--(*count)], sizeof(entries[0]));
-            else entries[target] = backup;
-            wipe_buffer(&backup, sizeof(backup));
+            else entries[target] = *backup;
+            secure_free(backup);
             log_event("ADD", "FAIL", "save_failed");
             fputs("Could not save the vault.\n", stderr);
             return -1;
         }
-        wipe_buffer(&backup, sizeof(backup));
+        secure_free(backup);
         log_event("ADD", "OK", is_new ? "entry_added" : "entry_updated");
         puts("Entry saved.");
         return handle_pending_signals() != 0 ? -2 : 0;
@@ -402,7 +426,13 @@ static int run_command(const char *command, const char *arg, char *master, size_
         fputs("Entry not found.\n", stderr);
         return -1;
     }
-    Credential backup = entries[index];
+    Credential *backup = secure_alloc(sizeof(Credential));
+    if (!backup) {
+        log_event("DEL", "FAIL", "memory_error");
+        fputs("Secure memory is unavailable.\n", stderr);
+        return -1;
+    }
+    *backup = entries[index];
     for (size_t i = (size_t)index + 1; i < *count; i++) {
         entries[i - 1] = entries[i];
     }
@@ -412,14 +442,14 @@ static int run_command(const char *command, const char *arg, char *master, size_
         for (size_t i = *count; i > (size_t)index; i--) {
             entries[i] = entries[i - 1];
         }
-        entries[index] = backup;
+        entries[index] = *backup;
         (*count)++;
-        wipe_buffer(&backup, sizeof(backup));
+        secure_free(backup);
         log_event("DEL", "FAIL", "save_failed");
         fputs("Could not save the vault.\n", stderr);
         return -1;
     }
-    wipe_buffer(&backup, sizeof(backup));
+    secure_free(backup);
     log_event("DEL", "OK", "entry_deleted");
     puts("Entry deleted.");
     return handle_pending_signals() != 0 ? -2 : 0;
@@ -438,7 +468,7 @@ static int finish_signal_exit(void) {
 
 int main(int argc, char **argv) {
     // Start up libsodium security library.
-    if (sodium_init() < 0) {
+    if (sodium_init() < 0 || disable_core_dumps() != 0) {
         fputs("Secure storage is unavailable.\n", stderr);
         return 1;
     }
@@ -453,8 +483,14 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    char master[PASS_LEN] = {0};
-    Credential entries[MAX_ENTRIES] = {0};
+    char *master = secure_alloc(PASS_LEN);
+    Credential *entries = secure_alloc(MAX_ENTRIES * sizeof(Credential));
+    if (!master || !entries) {
+        secure_free(master);
+        secure_free(entries);
+        fputs("Secure memory is unavailable.\n", stderr);
+        return 1;
+    }
     size_t count = 0;
     int unlocked = 0;
     int status = 1;
@@ -466,7 +502,7 @@ int main(int argc, char **argv) {
             goto done;
         }
         const char *arg = (argc == 3) ? argv[2] : NULL;
-        int rc = run_command(argv[1], arg, master, sizeof(master), entries, &count, &unlocked);
+        int rc = run_command(argv[1], arg, master, PASS_LEN, entries, &count, &unlocked);
         if (rc == -3) {
             usage(prog, 0);
             goto done;
@@ -542,7 +578,7 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        int cmd_rc = run_command(cmd, arg, master, sizeof(master), entries, &count, &unlocked);
+        int cmd_rc = run_command(cmd, arg, master, PASS_LEN, entries, &count, &unlocked);
         wipe_buffer(line, sizeof(line));
         if (cmd_rc == -2) {
             status = finish_signal_exit();
@@ -557,8 +593,8 @@ int main(int argc, char **argv) {
     }
 
 done:
-    // Wipe sensitive password and entry buffers from RAM before exiting.
-    wipe_buffer(master, sizeof(master));
-    wipe_buffer(entries, sizeof(entries));
+    // Wipe, munlock, and release locked secret buffers before exiting.
+    secure_free(master);
+    secure_free(entries);
     return status;
 }

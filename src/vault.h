@@ -25,6 +25,15 @@ int handle_pending_signals(void);
 // Read user input. Hides typing if hidden is 1. Returns 0, -1 (error/EOF), or -2 (signal).
 int prompt_input(const char *prompt, char *buffer, size_t size, int hidden);
 
+// Disable core dumps and non-root process memory inspection.
+int disable_core_dumps(void);
+
+// Allocate a guarded, swap-locked zero-initialized secret buffer.
+void *secure_alloc(size_t size);
+
+// Wipe, unlock, and release a buffer created by secure_alloc().
+void secure_free(void *ptr);
+
 // Clear sensitive data from memory.
 void wipe_buffer(void *ptr, size_t size);
 

@@ -7,7 +7,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -101,6 +105,34 @@ int handle_pending_signals(void) {
     if (g_term_sig) return 128 + (int)g_term_sig;
     if (g_got_sigint && confirm_sigint_exit()) return 128 + (int)g_term_sig;
     return 0;
+}
+
+// Disable OS core dumps and ptrace/proc-mem inspection where supported.
+int disable_core_dumps(void) {
+    struct rlimit lim = {0, 0};
+    if (setrlimit(RLIMIT_CORE, &lim) != 0) return -1;
+#ifdef __linux__
+    if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0) return -1;
+#endif
+    return 0;
+}
+
+// Allocate guarded pages locked into physical RAM (mlock + MADV_DONTDUMP) and zero them.
+void *secure_alloc(size_t size) {
+    if (!size) return NULL;
+    void *ptr = sodium_malloc(size);
+    if (!ptr) return NULL;
+    if (sodium_mlock(ptr, size) != 0) {
+        sodium_free(ptr);
+        return NULL;
+    }
+    sodium_memzero(ptr, size);
+    return ptr;
+}
+
+// Wipe, unlock from physical RAM, and release a buffer allocated with secure_alloc().
+void secure_free(void *ptr) {
+    if (ptr) sodium_free(ptr);
 }
 
 // Overwrite memory with zeros so secrets do not stay in RAM.
@@ -260,7 +292,8 @@ static int vault_write_file(const char *master_password, const Credential *entri
     unsigned char header[HEADER_SIZE];
     unsigned char *salt = header + HEADER_META_LEN;
     unsigned char *nonce = salt + crypto_pwhash_SALTBYTES;
-    unsigned char key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
+    unsigned char *key = secure_alloc(crypto_aead_xchacha20poly1305_ietf_KEYBYTES);
+    if (!key) return -1;
     unsigned char cipher[MAX_CIPHER_SIZE];
     unsigned long long cipher_len = 0;
 
@@ -273,7 +306,7 @@ static int vault_write_file(const char *master_password, const Credential *entri
     randombytes_buf(nonce, crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
 
     if (derive_key(master_password, salt, key) != 0) {
-        wipe_buffer(key, sizeof(key));
+        secure_free(key);
         return -1;
     }
 
@@ -283,7 +316,7 @@ static int vault_write_file(const char *master_password, const Credential *entri
     const unsigned char *plain = count ? (const unsigned char *)entries : &empty;
     int encrypted = crypto_aead_xchacha20poly1305_ietf_encrypt(
         cipher, &cipher_len, plain, plain_len, header, sizeof(header), NULL, nonce, key);
-    wipe_buffer(key, sizeof(key));
+    secure_free(key);
 
     if (encrypted != 0 || cipher_len != plain_len + crypto_aead_xchacha20poly1305_ietf_ABYTES) {
         wipe_buffer(cipher, sizeof(cipher));
@@ -392,9 +425,13 @@ int vault_load(const char *master_password, Credential *entries, size_t *count_o
 
     const unsigned char *salt = header + HEADER_META_LEN;
     const unsigned char *nonce = salt + crypto_pwhash_SALTBYTES;
-    unsigned char key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
+    unsigned char *key = secure_alloc(crypto_aead_xchacha20poly1305_ietf_KEYBYTES);
+    if (!key) {
+        wipe_buffer(cipher, sizeof(cipher));
+        return -1;
+    }
     if (derive_key(master_password, salt, key) != 0) {
-        wipe_buffer(key, sizeof(key));
+        secure_free(key);
         wipe_buffer(cipher, sizeof(cipher));
         return -1;
     }
@@ -402,7 +439,7 @@ int vault_load(const char *master_password, Credential *entries, size_t *count_o
     unsigned long long opened_len = 0;
     int opened = crypto_aead_xchacha20poly1305_ietf_decrypt(
         (unsigned char *)entries, &opened_len, NULL, cipher, cipher_len, header, sizeof(header), nonce, key);
-    wipe_buffer(key, sizeof(key));
+    secure_free(key);
     wipe_buffer(cipher, sizeof(cipher));
 
     if (opened != 0 || opened_len != plain_len) {
