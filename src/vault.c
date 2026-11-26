@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 #include <sodium.h>
 
@@ -372,4 +373,57 @@ int vault_load(const char *master_password, Credential *entries, size_t *count_o
         }
     }
     return 0;
+}
+
+// Accept only safe identifier characters in log fields to prevent log injection.
+static int valid_log_token(const char *s) {
+    if (!s || !s[0]) return 0;
+    size_t len = strlen(s);
+    if (len > 48) return 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)s[i];
+        int ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                 (ch >= '0' && ch <= '9') || ch == '_' || ch == '-';
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+// Append one structured event line to spm.log with symlink, type, owner, and permission checks.
+void log_event(const char *event, const char *outcome, const char *detail) {
+    const char *safe_detail = (detail && detail[0]) ? detail : "none";
+    if (!valid_log_token(event) || !valid_log_token(outcome) || !valid_log_token(safe_detail)) return;
+
+    char ts[32] = "unknown";
+    time_t now = time(NULL);
+    struct tm utc_tm;
+    memset(&utc_tm, 0, sizeof(utc_tm));
+    if (now != (time_t)-1 && gmtime_r(&now, &utc_tm) != NULL) {
+        if (strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &utc_tm) == 0) {
+            snprintf(ts, sizeof(ts), "%s", "unknown");
+        }
+    }
+
+    char line[256];
+    int n = snprintf(line, sizeof(line), "ts=%s uid=%lu pid=%ld event=%s outcome=%s detail=%s\n",
+                     ts, (unsigned long)getuid(), (long)getpid(), event, outcome, safe_detail);
+    if (n <= 0 || (size_t)n >= sizeof(line)) return;
+
+    // O_NOFOLLOW blocks symlinks; O_NONBLOCK avoids hanging if an attacker placed a FIFO.
+    int fd = open(LOG_FILE, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_NONBLOCK, 0600);
+    if (fd < 0) {
+        fputs("Warning: could not update log file.\n", stderr);
+        return;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid() ||
+        fchmod(fd, 0600) != 0 || write_all(fd, line, (size_t)n) != 0) {
+        close(fd);
+        fputs("Warning: could not update log file.\n", stderr);
+        return;
+    }
+    if (close(fd) != 0) {
+        fputs("Warning: could not update log file.\n", stderr);
+    }
 }

@@ -72,6 +72,7 @@ static int ensure_unlocked(char *master, size_t master_sz, Credential *entries,
     int rc = prompt_input("Master password: ", master, master_sz, 1);
     if (rc == -2) return -2;
     if (rc != 0 || !master[0]) {
+        log_event("UNLOCK", "FAIL", "invalid_input");
         fputs("Invalid password input.\n", stderr);
         return -1;
     }
@@ -79,11 +80,13 @@ static int ensure_unlocked(char *master, size_t master_sz, Credential *entries,
     if (vault_load(master, entries, count) != 0) {
         wipe_buffer(master, master_sz);
         if (handle_pending_signals() != 0) return -2;
+        log_event("UNLOCK", "FAIL", "unlock_failed");
         fputs("Could not unlock the vault.\n", stderr);
         return -1;
     }
     if (handle_pending_signals() != 0) return -2;
     *unlocked = 1;
+    log_event("UNLOCK", "OK", "vault_unlocked");
     return 0;
 }
 
@@ -104,6 +107,7 @@ static int run_command(const char *command, const char *arg, char *master, size_
     if (is_init) {
         struct stat st;
         if (lstat(VAULT_FILE, &st) == 0) {
+            log_event("INIT", "FAIL", "vault_exists");
             fputs("A vault already exists.\n", stderr);
             return -1;
         }
@@ -112,11 +116,13 @@ static int run_command(const char *command, const char *arg, char *master, size_
         if (rc == -2) { wipe_buffer(new_master, sizeof(new_master)); return -2; }
         if (rc != 0 || !new_master[0]) {
             wipe_buffer(new_master, sizeof(new_master));
+            log_event("INIT", "FAIL", "invalid_input");
             fputs("Invalid password input.\n", stderr);
             return -1;
         }
         if (vault_save(new_master, NULL, 0) != 0) {
             wipe_buffer(new_master, sizeof(new_master));
+            log_event("INIT", "FAIL", "save_failed");
             fputs("Could not create the vault.\n", stderr);
             return -1;
         }
@@ -125,6 +131,7 @@ static int run_command(const char *command, const char *arg, char *master, size_
         wipe_buffer(new_master, sizeof(new_master));
         *count = 0;
         *unlocked = 1;
+        log_event("INIT", "OK", "vault_created");
         puts("Vault created.");
         return handle_pending_signals() != 0 ? -2 : 0;
     }
@@ -137,6 +144,7 @@ static int run_command(const char *command, const char *arg, char *master, size_
             printf("%s (user: %s)\n", entries[i].service, entries[i].username);
         }
         if (!*count) puts("Vault is empty.");
+        log_event("LIST", "OK", NULL);
         return 0;
     }
 
@@ -144,6 +152,7 @@ static int run_command(const char *command, const char *arg, char *master, size_
         int index = find_service(entries, *count, arg);
         int is_new = index < 0;
         if (is_new && *count == MAX_ENTRIES) {
+            log_event("ADD", "FAIL", "vault_full");
             fputs("Vault is full.\n", stderr);
             return -1;
         }
@@ -154,6 +163,7 @@ static int run_command(const char *command, const char *arg, char *master, size_
         if (rc == -2) { wipe_buffer(user_buf, sizeof(user_buf)); return -2; }
         if (rc != 0 || !user_buf[0]) {
             wipe_buffer(user_buf, sizeof(user_buf));
+            log_event("ADD", "FAIL", "invalid_input");
             fputs("Invalid entry input.\n", stderr);
             return -1;
         }
@@ -167,6 +177,7 @@ static int run_command(const char *command, const char *arg, char *master, size_
         if (rc != 0 || !pass_buf[0]) {
             wipe_buffer(user_buf, sizeof(user_buf));
             wipe_buffer(pass_buf, sizeof(pass_buf));
+            log_event("ADD", "FAIL", "invalid_input");
             fputs("Invalid entry input.\n", stderr);
             return -1;
         }
@@ -185,10 +196,12 @@ static int run_command(const char *command, const char *arg, char *master, size_
             if (is_new) wipe_buffer(&entries[--(*count)], sizeof(entries[0]));
             else entries[target] = backup;
             wipe_buffer(&backup, sizeof(backup));
+            log_event("ADD", "FAIL", "save_failed");
             fputs("Could not save the vault.\n", stderr);
             return -1;
         }
         wipe_buffer(&backup, sizeof(backup));
+        log_event("ADD", "OK", is_new ? "entry_added" : "entry_updated");
         puts("Entry saved.");
         return handle_pending_signals() != 0 ? -2 : 0;
     }
@@ -196,13 +209,16 @@ static int run_command(const char *command, const char *arg, char *master, size_
     if (is_get) {
         int index = find_service(entries, *count, arg);
         if (index < 0) {
+            log_event("GET", "FAIL", "not_found");
             fputs("Entry not found.\n", stderr);
             return -1;
         }
         if (copy_to_clipboard(entries[index].password) != 0) {
+            log_event("GET", "FAIL", "clipboard_failed");
             fputs("Could not copy to clipboard.\n", stderr);
             return -1;
         }
+        log_event("GET", "OK", "clipboard_started");
         puts("Clipboard helper started.");
         return 0;
     }
@@ -210,6 +226,7 @@ static int run_command(const char *command, const char *arg, char *master, size_
     // is_del
     int index = find_service(entries, *count, arg);
     if (index < 0) {
+        log_event("DEL", "FAIL", "not_found");
         fputs("Entry not found.\n", stderr);
         return -1;
     }
@@ -226,12 +243,25 @@ static int run_command(const char *command, const char *arg, char *master, size_
         entries[index] = backup;
         (*count)++;
         wipe_buffer(&backup, sizeof(backup));
+        log_event("DEL", "FAIL", "save_failed");
         fputs("Could not save the vault.\n", stderr);
         return -1;
     }
     wipe_buffer(&backup, sizeof(backup));
+    log_event("DEL", "OK", "entry_deleted");
     puts("Entry deleted.");
     return handle_pending_signals() != 0 ? -2 : 0;
+}
+
+// Log signal-triggered termination and return its shell exit status.
+static int finish_signal_exit(void) {
+    int sig_rc = handle_pending_signals();
+    if (sig_rc == 0) sig_rc = 130;
+    const char *reason = (sig_rc == 128 + SIGINT) ? "sigint" :
+                         (sig_rc == 128 + SIGTERM) ? "sigterm" :
+                         (sig_rc == 128 + SIGHUP) ? "sighup" : "signal";
+    log_event("SIGNAL_EXIT", "OK", reason);
+    return sig_rc;
 }
 
 int main(int argc, char **argv) {
@@ -270,8 +300,7 @@ int main(int argc, char **argv) {
             goto done;
         }
         if (rc == -2) {
-            status = handle_pending_signals();
-            if (status == 0) status = 130;
+            status = finish_signal_exit();
             goto done;
         }
         status = (rc == 0) ? 0 : 1;
@@ -281,21 +310,23 @@ int main(int argc, char **argv) {
     // Interactive mode when started with no arguments.
     puts("Interactive mode. Type 'help' or 'exit'.");
     for (;;) {
-        int sig_rc = handle_pending_signals();
-        if (sig_rc != 0) { status = sig_rc; goto done; }
+        if (handle_pending_signals() != 0) {
+            status = finish_signal_exit();
+            goto done;
+        }
 
         char line[256] = {0};
         int rc = prompt_input("spm> ", line, sizeof(line), 0);
         if (rc == -2) {
             wipe_buffer(line, sizeof(line));
-            status = handle_pending_signals();
-            if (status == 0) status = 130;
+            status = finish_signal_exit();
             goto done;
         }
         if (rc != 0) {
             wipe_buffer(line, sizeof(line));
             if (feof(stdin) && !ferror(stdin)) {
                 fputc('\n', stdout);
+                log_event("SESSION", "OK", "clean_exit");
                 status = 0;
                 goto done;
             }
@@ -329,6 +360,7 @@ int main(int argc, char **argv) {
 
         if ((strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) && !arg) {
             wipe_buffer(line, sizeof(line));
+            log_event("SESSION", "OK", "clean_exit");
             status = 0;
             goto done;
         }
@@ -341,14 +373,15 @@ int main(int argc, char **argv) {
         int cmd_rc = run_command(cmd, arg, master, sizeof(master), entries, &count, &unlocked);
         wipe_buffer(line, sizeof(line));
         if (cmd_rc == -2) {
-            status = handle_pending_signals();
-            if (status == 0) status = 130;
+            status = finish_signal_exit();
             goto done;
         }
         if (cmd_rc == -3) usage(prog, 1);
 
-        sig_rc = handle_pending_signals();
-        if (sig_rc != 0) { status = sig_rc; goto done; }
+        if (handle_pending_signals() != 0) {
+            status = finish_signal_exit();
+            goto done;
+        }
     }
 
 done:

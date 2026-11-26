@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #define VAULT_FILE  "vault.bin"
+#define LOG_FILE    "spm.log"
 #define MAX_ENTRIES 50
 #define STR_LEN     64
 #define PASS_LEN    128
@@ -26,6 +27,9 @@ int prompt_input(const char *prompt, char *buffer, size_t size, int hidden);
 
 // Clear sensitive data from memory.
 void wipe_buffer(void *ptr, size_t size);
+
+// Append a structured audit event without secrets to spm.log.
+void log_event(const char *event, const char *outcome, const char *detail);
 
 // Encrypt and save all entries to the vault file.
 int vault_save(const char *master_password, const Credential *entries, size_t count);
