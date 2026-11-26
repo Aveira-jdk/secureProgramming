@@ -31,10 +31,16 @@ void wipe_buffer(void *ptr, size_t size);
 // Append a structured audit event without secrets to spm.log.
 void log_event(const char *event, const char *outcome, const char *detail);
 
-// Encrypt and save all entries to the vault file.
+// Atomically create a new vault file (fails if vault.bin already exists).
+int vault_create(const char *master_password);
+
+// Encrypt and save all entries to an existing owned vault file.
 int vault_save(const char *master_password, const Credential *entries, size_t count);
 
 // Decrypt and load all entries from the vault file.
 int vault_load(const char *master_password, Credential *entries, size_t *count_out);
+
+// Overwrite and delete an existing owned vault file.
+int vault_delete(void);
 
 #endif
