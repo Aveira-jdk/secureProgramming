@@ -48,16 +48,22 @@ static void signal_handler(int sig) {
     errno = saved_errno;
 }
 
-// Reject lines containing embedded NUL bytes or exceeding size - 1 (must zero buf before fgets).
+// Reject lines with embedded NUL bytes (before \n or EOF) or exceeding size - 1 (prefill buf with '\n').
 static int finish_fgets_line(char *buf, size_t size) {
-    char *nl = memchr(buf, '\n', size);
-    if (nl) {
-        size_t idx = (size_t)(nl - buf);
-        if (memchr(buf, '\0', idx) != NULL) {
+    size_t end = size;
+    while (end > 0 && buf[end - 1] == '\n') end--;
+    if (end == 0) {
+        wipe_buffer(buf, size);
+        return -1;
+    }
+    size_t bytes_read = end - 1;
+    if (bytes_read > 0 && buf[bytes_read - 1] == '\n') {
+        size_t line_len = bytes_read - 1;
+        if (memchr(buf, '\0', line_len) != NULL) {
             wipe_buffer(buf, size);
             return -1;
         }
-        buf[idx] = '\0';
+        wipe_buffer(buf + line_len, size - line_len);
         return 0;
     }
     if (!feof(stdin)) {
@@ -66,6 +72,11 @@ static int finish_fgets_line(char *buf, size_t size) {
         wipe_buffer(buf, size);
         return -1;
     }
+    if (memchr(buf, '\0', bytes_read) != NULL) {
+        wipe_buffer(buf, size);
+        return -1;
+    }
+    wipe_buffer(buf + bytes_read, size - bytes_read);
     return 0;
 }
 
@@ -95,7 +106,8 @@ static int confirm_sigint_exit(void) {
         fputs("\nExit cleanly? [y/N]: ", stdout);
         fflush(stdout);
 
-        char ans[16] = {0};
+        char ans[16];
+        memset(ans, '\n', sizeof(ans));
         if (!fgets(ans, (int)sizeof(ans), stdin)) {
             g_in_confirm = 0;
             fputc('\n', stdout);
@@ -189,9 +201,9 @@ int prompt_input(const char *prompt, char *buffer, size_t size, int hidden) {
         // Show prompt to the user.
         if (prompt) { fputs(prompt, stdout); fflush(stdout); }
 
-        // Zero buffer first so finish_fgets_line() can detect embedded NUL bytes.
+        // Prefill with '\n' so finish_fgets_line() knows the exact bytes read before EOF or '\n'.
         clearerr(stdin);
-        wipe_buffer(buffer, size);
+        memset(buffer, '\n', size);
         char *result = NULL;
         if (!g_term_sig && !g_got_sigint) {
             result = fgets(buffer, (int)size, stdin);

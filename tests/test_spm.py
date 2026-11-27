@@ -265,6 +265,25 @@ def test_init_and_validation(tmp):
     assert b"Invalid entry password." in r_nul.stderr
     assert b"a._-@+1 (user: u._-@+2)" in r_nul.stdout
 
+    # Embedded NUL before EOF with no trailing newline must also be rejected cleanly
+    r_nul_eof = subprocess.run(
+        [SPM, "list"],
+        cwd=d,
+        input=MASTER_PW[:4].encode() + b"\x00" + MASTER_PW[4:].encode(),
+        capture_output=True,
+    )
+    assert r_nul_eof.returncode == 1 and b"Unlock cancelled." in r_nul_eof.stderr
+    assert b"Could not unlock" not in r_nul_eof.stderr
+    assert open(os.path.join(d, "vault.bin"), "rb").read()[5] == 0
+
+    r_add_nul_eof = subprocess.run(
+        [SPM, "add", "nuleof.org"],
+        cwd=d,
+        input=MASTER_PW.encode() + b"\nbob\npw\x00extra",
+        capture_output=True,
+    )
+    assert r_add_nul_eof.returncode == 1 and b"Invalid entry password." in r_add_nul_eof.stderr
+
     # Exact 126-char max master password init + unlock check
     d_max = os.path.join(tmp, "max_master")
     os.makedirs(d_max)
