@@ -574,8 +574,9 @@ static int finish_signal_exit(void) {
 }
 
 int main(int argc, char **argv) {
-    // Start up libsodium security library.
-    if (sodium_init() < 0 || disable_core_dumps() != 0 || setup_signals() != 0) {
+    // Disable stdio read-ahead buffering on stdin so pselect() and locked buffers stay consistent.
+    if (setvbuf(stdin, NULL, _IONBF, 0) != 0 ||
+        sodium_init() < 0 || disable_core_dumps() != 0 || setup_signals() != 0) {
         fputs("Secure storage is unavailable.\n", stderr);
         return 1;
     }

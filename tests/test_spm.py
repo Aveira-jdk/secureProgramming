@@ -697,11 +697,12 @@ def test_memory_and_core_dumps(tmp):
         os.close(m)
         assert os.listdir(d) == [], f"Unexpected core dump created: {os.listdir(d)}"
 
-        def zero_mlock():
-            resource.setrlimit(resource.RLIMIT_MEMLOCK, (0, 0))
+        if os.geteuid() != 0:
+            def zero_mlock():
+                resource.setrlimit(resource.RLIMIT_MEMLOCK, (0, 0))
 
-        r = subprocess.run([SPM, "list"], cwd=d, text=True, capture_output=True, preexec_fn=zero_mlock)
-        assert r.returncode == 1 and "Secure memory is unavailable." in r.stderr
+            r = subprocess.run([SPM, "list"], cwd=d, text=True, capture_output=True, preexec_fn=zero_mlock)
+            assert r.returncode == 1 and "Secure memory is unavailable." in r.stderr
     else:
         os.write(m, b"exit\n")
         assert wait_tty(p, m)[0] == 0

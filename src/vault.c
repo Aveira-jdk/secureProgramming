@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #ifdef __linux__
 #include <sys/prctl.h>
@@ -98,6 +99,39 @@ int setup_signals(void) {
     return 0;
 }
 
+// Atomically check pending signal flags and wait for readable stdin with pselect().
+static int wait_for_stdin(int handle_sigint) {
+    sigset_t mask, old_mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGHUP);
+    if (sigprocmask(SIG_BLOCK, &mask, &old_mask) != 0) return -1;
+
+    int ready = 0;
+    for (;;) {
+        if (g_term_sig || (handle_sigint && g_got_sigint)) {
+            ready = 0;
+            break;
+        }
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(STDIN_FILENO, &rfds);
+        int rc = pselect(STDIN_FILENO + 1, &rfds, NULL, NULL, NULL, &old_mask);
+        if (rc > 0) {
+            ready = (g_term_sig || (handle_sigint && g_got_sigint)) ? 0 : 1;
+            break;
+        }
+        if (rc < 0 && errno != EINTR) {
+            ready = -1;
+            break;
+        }
+    }
+
+    if (sigprocmask(SIG_SETMASK, &old_mask, NULL) != 0) return -1;
+    return ready;
+}
+
 static int confirm_sigint_exit(void) {
     g_in_confirm = 1;
     for (;;) {
@@ -108,7 +142,9 @@ static int confirm_sigint_exit(void) {
 
         char ans[16];
         memset(ans, '\n', sizeof(ans));
-        if (!fgets(ans, (int)sizeof(ans), stdin)) {
+        int wr = wait_for_stdin(0);
+        if (wr <= 0 || !fgets(ans, (int)sizeof(ans), stdin)) {
+            wipe_buffer(ans, sizeof(ans));
             g_in_confirm = 0;
             fputc('\n', stdout);
             if (!g_term_sig) g_term_sig = SIGINT;
@@ -201,11 +237,11 @@ int prompt_input(const char *prompt, char *buffer, size_t size, int hidden) {
         // Show prompt to the user.
         if (prompt) { fputs(prompt, stdout); fflush(stdout); }
 
-        // Prefill with '\n' so finish_fgets_line() knows the exact bytes read before EOF or '\n'.
+        // Prefill with '\n' and wait atomically with pselect() so signals cannot race before fgets().
         clearerr(stdin);
         memset(buffer, '\n', size);
         char *result = NULL;
-        if (!g_term_sig && !g_got_sigint) {
+        if (wait_for_stdin(1) > 0) {
             result = fgets(buffer, (int)size, stdin);
         }
 
