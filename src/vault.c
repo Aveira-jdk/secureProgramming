@@ -304,6 +304,12 @@ static int valid_vault_stat(const struct stat *st) {
            (st->st_mode & 0777) == 0600;
 }
 
+int vault_check_access(void) {
+    struct stat st;
+    if (lstat(VAULT_FILE, &st) != 0) return -1;
+    return valid_vault_stat(&st) ? 0 : -1;
+}
+
 // Flush containing directory metadata so create, rename, and unlink persist across crashes.
 static int sync_parent_dir(void) {
     int dir_fd = open(".", O_RDONLY | O_DIRECTORY);

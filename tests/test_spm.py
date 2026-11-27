@@ -521,8 +521,11 @@ def test_aad_permissions_and_del_vault(tmp):
     os.write(m, b"del git\n")
     assert b"Could not save the vault." in read_until(m, b"spm> ")
     os.write(m, b"list\n")
-    lout = read_until(m, b"spm> ")
-    assert b"git (user: root)" in lout and b"rolledback" not in lout
+    lbad = read_until(m, b"spm> ")
+    assert b"Could not access the vault." in lbad and b"git (user: root)" not in lbad
+    os.write(m, b"get git\n")
+    gbad = read_until(m, b"spm> ")
+    assert b"Could not access the vault." in gbad and b"in clipboard" not in gbad
 
     os.write(m, b"del-vault\n")
     read_until(m, b"Type YES to confirm: ")
@@ -530,6 +533,9 @@ def test_aad_permissions_and_del_vault(tmp):
     assert b"Could not delete the vault." in read_until(m, b"spm> ")
     assert os.path.exists(vp)
     os.chmod(vp, 0o600)
+    os.write(m, b"list\n")
+    lout = read_until(m, b"spm> ")
+    assert b"git (user: root)" in lout and b"rolledback" not in lout
 
     # del-vault cancel with 'yes', Ctrl+C abort, then YES delete + same-session re-init
     os.write(m, b"del-vault\n")
@@ -553,6 +559,8 @@ def test_aad_permissions_and_del_vault(tmp):
     os.write(m, b"YES\n")
     assert b"Vault deleted." in read_until(m, b"spm> ")
     d_log_txt = open(os.path.join(d, "spm.log"), encoding="utf-8").read()
+    assert "event=LIST outcome=FAIL detail=access_denied" in d_log_txt
+    assert "event=GET outcome=FAIL detail=access_denied" in d_log_txt
     assert "event=DEL_VAULT outcome=FAIL detail=delete_failed" in d_log_txt
     assert "event=DEL_VAULT outcome=FAIL detail=cancelled" in d_log_txt
     assert "event=DEL_VAULT outcome=OK detail=vault_deleted" in d_log_txt

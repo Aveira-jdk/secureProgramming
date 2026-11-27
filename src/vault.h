@@ -51,6 +51,9 @@ int vault_save(const char *master_password, const Credential *entries, size_t co
 // Decrypt and load entries. Returns 0 on success, -1 on error, or -2 if wiped after max failed attempts.
 int vault_load(const char *master_password, Credential *entries, size_t *count_out, int *attempts_left_out);
 
+// Verify that vault.bin is an owned 0600 regular file without following symlinks.
+int vault_check_access(void);
+
 // Overwrite and delete an existing owned vault file.
 int vault_delete(void);
 

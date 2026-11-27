@@ -30,15 +30,15 @@ Run `./spm` with no arguments to open the interactive `spm> ` prompt, or pass on
 ### File and access control
 - **Safe vault creation:** `vault_create()` uses `O_CREAT`, `O_EXCL`, `O_NOFOLLOW`, and `O_NONBLOCK` (`0600`) so `init` cannot overwrite an existing file or symlink in a race.
 - **Atomic updates:** `vault_save()` writes a temporary file (`0600`), flushes it with `fsync()`, swaps it in with `rename()`, and syncs the parent directory while blocking `SIGINT` and `SIGTERM`.
-- **Owner-only checks:** `vault.bin` must be a regular file (`S_ISREG`) owned by your `UID` and `GID` with `0600` permissions. Symlinks and named pipes (`FIFO`) are rejected.
+- **Owner-only checks:** `vault.bin` must be a regular file (`S_ISREG`) owned by your `UID` and `GID` with `0600` permissions. This ownership check runs across every vault and record operation (`init`, unlock, `list`, `get`, `add`, `del`, and `del-vault`), and symlinks and named pipes (`FIFO`) are rejected.
 
 ### Memory and process safety
 - **Swap locking:** Secret buffers (`master`, `entries`, encryption keys, password inputs, and edit/delete backups) are allocated with `sodium_malloc()` guard pages, locked into physical RAM with verified `sodium_mlock()`, and wiped/unlocked with `sodium_free()` (`sodium_memzero()`).
 - **No core dumps:** Startup disables crash dumps and non-root `/proc/<pid>/mem` reads using `setrlimit(RLIMIT_CORE, 0)` and Linux `prctl(PR_SET_DUMPABLE, 0)`.
 
 ### Input, signals, clipboard, and logging
-- **Input rules:** Services and usernames allow only `[A-Za-z0-9._-@+]` (no `.` or `..`). Passwords reject ASCII control bytes (`< 0x20` and `0x7F`).
-- **Timed clipboard:** `get` runs `wl-copy`, `xclip`, or `clip.exe` directly via `pipe()`, `fork()`, and `execv()` from absolute `PATH` folders only (no `/bin/sh`), and spawns a detached secret-free timer child that clears the clipboard after `30` seconds (`CLIPBOARD_TTL_SEC`, configurable downward via `SPM_CLIP_TIMEOUT`).
+- **Input rules:** Services and usernames allow only `[A-Za-z0-9._+@-]` (no `.` or `..`). Passwords reject ASCII control bytes (`< 0x20` and `0x7F`).
+- **Timed clipboard (Linux/WSL):** `get` supports Linux (`wl-copy`, `xclip`) and Windows/WSL (`clip.exe`) directly via `pipe()`, `fork()`, and `execv()` from absolute `PATH` folders only (no `/bin/sh`), and spawns a best-effort detached secret-free timer child that clears the clipboard after `30` seconds (`CLIPBOARD_TTL_SEC`, configurable downward via `SPM_CLIP_TIMEOUT`).
 - **Signals and echo:** Terminal `ECHO` is turned off before printing password prompts and restored before `Ctrl+C` (`Exit cleanly? [y/N]:`), `SIGTERM`, and `SIGHUP` exits. `Ctrl+Z` (`SIGTSTP`) is ignored so an unlocked vault cannot be paused in background RAM.
 - **Audit log (`spm.log`):** Writes allowlisted `[A-Za-z0-9_-]` UTC event records (`ts=... uid=... pid=... event=... outcome=... detail=...`) using `O_NOFOLLOW`, `O_NONBLOCK`, `S_ISREG`, UID checks, and `0600` mode. No passwords, usernames, service names, or raw `errno` text are logged.
 
@@ -62,7 +62,7 @@ flowchart LR
 | Area | Threat | Mitigation |
 |---|---|---|
 | Master password | Brute-forcing a copied `vault.bin` offline | `Argon2id` with a fresh 16-byte random salt slows down each guess. |
-| Interactive guessing | Guessing the password repeatedly on the machine | `10` consecutive failed unlocks overwrite and delete `vault.bin`. |
+| Interactive guessing | Guessing the password repeatedly on the active vault file | `10` consecutive failed unlocks overwrite and delete `vault.bin` (offline copies are protected by `Argon2id` and password strength). |
 | Files on disk | Other users, symlinks, FIFOs, or `init` file-swap races | `0600` mode, `UID`/`GID` checks, `O_NOFOLLOW`, `O_NONBLOCK`, and `O_EXCL`. |
 | File tampering | Modifying vault header, ciphertext, or tag | `XChaCha20-Poly1305` verifies both records and immutable `48`-byte header bytes (`AAD`). |
 | Secrets in RAM | Passwords leaking to swap, core dumps, or `/proc/pid/mem` | `sodium_malloc()` + `sodium_mlock()`, `RLIMIT_CORE = 0`, `PR_SET_DUMPABLE = 0`, and `sodium_memzero()`. |

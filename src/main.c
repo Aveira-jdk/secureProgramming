@@ -381,6 +381,11 @@ static int run_command(const char *command, const char *arg, char *master, size_
     if (unlock_rc != 0) return unlock_rc;
 
     if (is_list) {
+        if (vault_check_access() != 0) {
+            log_event("LIST", "FAIL", "access_denied");
+            fputs("Could not access the vault.\n", stderr);
+            return -1;
+        }
         for (size_t i = 0; i < *count; i++) {
             printf("%s (user: %s)\n", entries[i].service, entries[i].username);
         }
@@ -469,6 +474,11 @@ static int run_command(const char *command, const char *arg, char *master, size_
     }
 
     if (is_get) {
+        if (vault_check_access() != 0) {
+            log_event("GET", "FAIL", "access_denied");
+            fputs("Could not access the vault.\n", stderr);
+            return -1;
+        }
         int index = find_service(entries, *count, arg);
         if (index < 0) {
             log_event("GET", "FAIL", "not_found");
