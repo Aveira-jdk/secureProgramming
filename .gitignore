@@ -8,3 +8,5 @@ obj/
 spm
 vault.bin
 *.o
+spm.log
+spm_asan

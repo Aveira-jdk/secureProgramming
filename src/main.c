@@ -324,7 +324,7 @@ static int run_command(const char *command, const char *arg, char *master, size_
             return -1;
         }
 
-        char user_buf[STR_LEN] = {0};
+        char user_buf[STR_LEN + 1] = {0};
         int rc = prompt_input("Username: ", user_buf, sizeof(user_buf), 0);
         if (rc == -2) { wipe_buffer(user_buf, sizeof(user_buf)); return -2; }
         if (rc != 0 || !valid_ident(user_buf)) {

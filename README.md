@@ -1,93 +1,115 @@
 # Secure Password Manager
 
-Secure Password Manager (SPM) is a single-user CLI password manager written in C for the ICS0022 Secure Programming course. It lets a user store, view, and delete credentials inside one encrypted vault file (`vault.bin`).
+Secure Password Manager (`spm`) is a single-user CLI and interactive password manager in C for ICS0022 Secure Programming.
+It keeps encrypted credentials in `vault.bin` and writes event records (with no secrets) to `spm.log`.
 
-## Scope and commands
+## Commands
 
-- `./spm init`: Create a new vault and set a master password.
-- `./spm add <service>`: Add or update a username and password for a service.
-- `./spm list`: Show saved services and usernames (passwords are never shown).
-- `./spm get <service>`: Copy a password directly to the system clipboard without printing it.
-- `./spm del <service>`: Delete an entry from the vault.
-- `./spm help`: Show command usage.
+Run `./spm` with no arguments to open the interactive `spm> ` prompt, or pass one command directly on the command line:
 
-## Design choices
+- `./spm`: Start an interactive `spm> ` session (`exit`, `quit`, or `Ctrl+D` exits cleanly).
+- `./spm init`: Create `vault.bin` and set a master password (`8` to `126` characters, confirmed twice).
+- `./spm add <service>`: Add or update a username and password.
+- `./spm list`: List saved services and usernames (passwords are never printed).
+- `./spm get <service>`: Copy the password to the clipboard and print `<service> (user: ...)` and `<service> (pass: in clipboard)`.
+- `./spm del <service>`: Delete one entry from the vault.
+- `./spm del-vault`: Unlock, confirm by typing `YES`, overwrite, and delete `vault.bin`.
+- `./spm help` (or `--help`): Show command usage.
 
-SPM uses `libsodium` for cryptographic operations and key derivation:
+## Security and design
 
-- **Key derivation:** `Argon2id` (`crypto_pwhash`) turns the master password into an encryption key using a fresh 16-byte random salt. The master password itself is never written to disk.
-- **Authenticated encryption:** `XChaCha20-Poly1305` (`crypto_aead_xchacha20poly1305_ietf`) encrypts all vault entries. If the password is wrong or the file was changed, decryption fails immediately.
-- **Binary records format:** Entries use fixed-size binary records (`Credential` struct) instead of text files. This avoids delimiter bugs and string injection problems.
-- **Atomic file writes:** Changes are written to a temporary file first. The file is synced to disk with `fsync()` and moved into place with `rename()`. Permissions are restricted to owner-only (`0600`). This protects against file corruption if interrupted.
-- **Memory safety:** Passwords, keys, and decrypted records are wiped from memory using `sodium_memzero()` before the program exits.
-- **Hidden input and clipboard output:** Typing is hidden with `<termios.h>` when entering passwords. The `get` command copies passwords directly to clipboard tools (`wl-copy`, `xclip`, `clip.exe`). Passwords never appear on screen or in shell history.
+### Cryptography and vault format
+- **Key derivation:** `Argon2id` (`crypto_pwhash`, interactive limits) turns the master password and a fresh 16-byte random salt into a 32-byte key on every save. The master password is never stored on disk.
+- **Authenticated encryption:** `XChaCha20-Poly1305` (`crypto_aead_xchacha20poly1305_ietf`) encrypts up to `50` fixed-size `Credential` records (`MAX_ENTRIES = 50`).
+- **Header and AAD:** `vault.bin` starts with a `48`-byte `"SPM1"` header (`magic`, `version`, `fail_count`, `reserved[2]`, `salt`, `nonce`). All immutable header fields are verified via `AAD` (with `fail_count` at byte offset `5` masked to `0`). Changing any protected byte fails decryption.
+
+### Authentication and brute-force protection
+- **Interactive unlock retry:** Wrong passwords stay inside the `Master password:` prompt until you enter the right password, press `Ctrl+D` to cancel, or reach the failure limit.
+- **10-attempt wipe:** Byte `5` (`fail_count`) tracks consecutive failed unlocks using `pwrite()` + `fsync()`. A valid unlock resets it to `0`; `10` consecutive failures overwrite `vault.bin` with random bytes and delete it.
+
+### File and access control
+- **Safe vault creation:** `vault_create()` uses `O_CREAT`, `O_EXCL`, `O_NOFOLLOW`, and `O_NONBLOCK` (`0600`) so `init` cannot overwrite an existing file or symlink in a race.
+- **Atomic updates:** `vault_save()` writes a temporary file (`0600`), flushes it with `fsync()`, and swaps it in with `rename()` while blocking `SIGINT` and `SIGTERM`.
+- **Owner-only checks:** `vault.bin` must be a regular file (`S_ISREG`) owned by your `UID` and `GID` with `0600` permissions. Symlinks and named pipes (`FIFO`) are rejected.
+
+### Memory and process safety
+- **Swap locking:** Secret buffers (`master`, `entries`, encryption keys, password inputs, and edit/delete backups) are allocated with `sodium_malloc()` guard pages, locked into physical RAM with verified `sodium_mlock()`, and wiped/unlocked with `sodium_free()` (`sodium_memzero()`).
+- **No core dumps:** Startup disables crash dumps and non-root `/proc/<pid>/mem` reads using `setrlimit(RLIMIT_CORE, 0)` and Linux `prctl(PR_SET_DUMPABLE, 0)`.
+
+### Input, signals, clipboard, and logging
+- **Input rules:** Services and usernames allow only `[A-Za-z0-9._-@+]` (no `.` or `..`). Passwords reject ASCII control bytes (`< 0x20` and `0x7F`).
+- **Safe clipboard:** `get` runs `wl-copy`, `xclip`, or `clip.exe` directly via `pipe()`, `fork()`, and `execvp()` from absolute `PATH` folders only (no `/bin/sh`).
+- **Signals and echo:** Terminal `ECHO` is turned off before printing password prompts and restored before `Ctrl+C` (`Exit cleanly? [y/N]:`), `SIGTERM`, and `SIGHUP` exits. `Ctrl+Z` (`SIGTSTP`) is ignored so an unlocked vault cannot be paused in background RAM.
+- **Audit log (`spm.log`):** Writes allowlisted `[A-Za-z0-9_-]` UTC event records (`ts=... uid=... pid=... event=... outcome=... detail=...`) using `O_NOFOLLOW`, `O_NONBLOCK`, `S_ISREG`, UID checks, and `0600` mode. No passwords, usernames, service names, or raw `errno` text are logged.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    User((User)) --> CLI[Command-line interface]
-    CLI -->|master password| Key[User management: Argon2id]
-    Key -->|key| Crypto[Encryption module: XChaCha20-Poly1305]
-    CLI <-->|entries| Crypto
-    Crypto <-->|encrypted data| Storage[Storage layer]
-    Storage <-->|atomic read and write| Vault[(vault.bin on disk)]
+    User((User)) --> CLI[CLI & validation: src/main.c]
+    CLI -->|master & entries| Sec[Locked RAM, signals & log: src/vault.c]
+    Sec -->|key derivation| KDF[Argon2id + XChaCha20-Poly1305]
+    KDF <-->|0600 atomic I/O & AAD| Vault[(vault.bin)]
+    Sec -->|secret-free events| Log[(spm.log)]
+    CLI -->|fork/execvp pipe| Clip[wl-copy / xclip / clip.exe]
 ```
 
-- **Command-line interface (`src/main.c`):** Parses arguments, validates inputs, and coordinates commands.
-- **User management & crypto (`src/vault.c`):** Uses `Argon2id` to derive the vault key, and `XChaCha20-Poly1305` to encrypt and decrypt records.
-- **Storage layer (`src/vault.c`):** Manages file I/O, atomic temporary file replacement, file permissions, and data integrity.
-- **Vault file (`vault.bin`):** Holds a 16-byte random salt, a 24-byte random nonce, and the encrypted records with a 16-byte Poly1305 authentication tag.
+- **`src/main.c`:** Command parsing, input allowlists, unlock retries, `del-vault`, and shell-free clipboard piping.
+- **`src/vault.c` & `src/vault.h`:** Signal handling, hidden input, RAM locking, core-dump blocking, Argon2id/AEAD crypto, vault storage, 10-attempt wipe, and `spm.log`.
 
 ## Threat model
 
-| Area | Threat | Implemented mitigation |
+| Area | Threat | Mitigation |
 |---|---|---|
-| Master password | Someone copies the vault file and tries to guess the master password. | `Argon2id` with a 16-byte random salt makes guessing the password very slow and memory-heavy. |
-| Vault on disk | Someone reads the vault file directly. | All entries are encrypted at rest with `XChaCha20-Poly1305`. File permissions are set to owner-only (`0600`). |
-| Vault on disk | Someone alters or corrupts bytes in the vault file. | Poly1305 checks the data during decryption. Any altered byte causes immediate rejection with a generic error. |
-| Vault in memory | Passwords or keys remain in RAM after the program finishes. | Master passwords, keys, and decrypted records are wiped with `sodium_memzero()` before exit. |
-| Interface | Oversized input or invalid characters cause memory corruption. | Input lengths are limited with `fgets()`. Extra characters in stdin are cleared, and service names only allow printable characters. |
-| Interface | A retrieved password remains visible in terminal scrollback. | Passwords are never printed on screen. The `get` command sends the secret straight to system clipboard helpers (`wl-copy`, `xclip`, `clip.exe`). |
+| Master password | Brute-forcing a copied `vault.bin` offline | `Argon2id` with a fresh 16-byte random salt slows down each guess. |
+| Interactive guessing | Guessing the password repeatedly on the machine | `10` consecutive failed unlocks overwrite and delete `vault.bin`. |
+| Files on disk | Other users, symlinks, FIFOs, or `init` file-swap races | `0600` mode, `UID`/`GID` checks, `O_NOFOLLOW`, `O_NONBLOCK`, and `O_EXCL`. |
+| File tampering | Modifying vault header, ciphertext, or tag | `XChaCha20-Poly1305` verifies both records and immutable `48`-byte header bytes (`AAD`). |
+| Secrets in RAM | Passwords leaking to swap, core dumps, or `/proc/pid/mem` | `sodium_malloc()` + `sodium_mlock()`, `RLIMIT_CORE = 0`, `PR_SET_DUMPABLE = 0`, and `sodium_memzero()`. |
+| Interface & clipboard | Shell/log injection, scrollback leaks, or stuck echo | Allowlists, `fork()`/`execvp()` without `/bin/sh`, `SIGTSTP` ignored, and `ECHO` restored on signals. |
+| Audit log | Log tampering by other users or log injection | `spm.log` (`0600`, `UID` check, `O_NOFOLLOW`, `O_NONBLOCK`) accepts only safe tokens and logs zero secrets. |
 
-## Build and run
+## Build, test, and run
 
 ### Prerequisites (Ubuntu or WSL)
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential libsodium-dev wl-clipboard xclip
+sudo apt install -y build-essential libsodium-dev python3 wl-clipboard xclip
 ```
 
-### Build
+### Build and test
 
-Compile the program with security flags (`-Wall -Wextra -Werror -pedantic -fanalyzer -D_FORTIFY_SOURCE=2 -fstack-protector-strong`):
+Compile with strict warning and hardening flags (`-Wall -Wextra -Werror -pedantic -fanalyzer -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE -pie`):
 
 ```bash
 make
 ```
 
-To clean build artifacts:
+Run the automated test suite (`7` test groups) and the sanitizer build (`ASan` + `UBSan`):
+
+```bash
+make test
+make asan
+```
+
+Remove build files (`obj/`, `spm`, `spm_asan`) while keeping `vault.bin` and `spm.log`:
 
 ```bash
 make clean
 ```
 
-### Usage example
+### Usage examples
 
 ```bash
-# 1. Initialize a new vault
+# Interactive mode
+./spm
+
+# One-shot CLI mode
 ./spm init
-
-# 2. Add an entry
-./spm add github
-
-# 3. List entries (shows services and usernames, never passwords)
+./spm add github.com
 ./spm list
-
-# 4. Copy password to clipboard
-./spm get github
-
-# 5. Delete an entry
-./spm del github
+./spm get github.com
+./spm del github.com
+./spm del-vault
 ```
