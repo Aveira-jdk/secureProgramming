@@ -185,26 +185,45 @@ static int ensure_unlocked(char *master, size_t master_sz, Credential *entries,
         return -1;
     }
 
-    int rc = prompt_input("Master password: ", master, master_sz, 1);
-    if (rc == -2) return -2;
-    if (rc != 0 || !valid_password(master, 1)) {
-        wipe_buffer(master, master_sz);
-        log_event("UNLOCK", "FAIL", "invalid_input");
-        fputs("Invalid password input.\n", stderr);
-        return -1;
-    }
+    for (;;) {
+        int rc = prompt_input("Master password: ", master, master_sz, 1);
+        if (rc == -2) return -2;
+        if (rc != 0 || !valid_password(master, 1)) {
+            wipe_buffer(master, master_sz);
+            log_event("UNLOCK", "FAIL", "invalid_input");
+            if (rc != 0 && (feof(stdin) || ferror(stdin))) {
+                fputs("Unlock cancelled.\n", stderr);
+                return -1;
+            }
+            fputs("Invalid password input.\n", stderr);
+            continue;
+        }
 
-    if (vault_load(master, entries, count) != 0) {
+        int attempts_left = -1;
+        int load_rc = vault_load(master, entries, count, &attempts_left);
+        if (load_rc == 0) {
+            if (handle_pending_signals() != 0) return -2;
+            *unlocked = 1;
+            log_event("UNLOCK", "OK", "vault_unlocked");
+            return 0;
+        }
+
         wipe_buffer(master, master_sz);
         if (handle_pending_signals() != 0) return -2;
+        if (load_rc == -2) {
+            log_event("UNLOCK", "FAIL", "max_attempts_wiped");
+            fputs("Maximum failed attempts reached. Vault destroyed.\n", stderr);
+            return -1;
+        }
         log_event("UNLOCK", "FAIL", "unlock_failed");
+        if (attempts_left > 0) {
+            fprintf(stderr, "Could not unlock the vault (%d %s remaining).\n",
+                    attempts_left, attempts_left == 1 ? "attempt" : "attempts");
+            continue;
+        }
         fputs("Could not unlock the vault.\n", stderr);
         return -1;
     }
-    if (handle_pending_signals() != 0) return -2;
-    *unlocked = 1;
-    log_event("UNLOCK", "OK", "vault_unlocked");
-    return 0;
 }
 
 // Execute one command. Returns 0 on success, -1 on runtime error, -2 on signal abort, -3 on bad syntax.

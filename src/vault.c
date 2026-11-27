@@ -17,9 +17,10 @@
 #include <unistd.h>
 #include <sodium.h>
 
-// Authenticated header: 4-byte magic ("SPM1"), version (1), reserved (3 bytes), salt, nonce.
+// Header: 4-byte magic ("SPM1"), version (1), fail_count (offset 5, unauthenticated), reserved[2], salt, nonce.
 #define VAULT_MAGIC_LEN 4
 #define VAULT_VERSION   1
+#define FAIL_OFFSET     5
 #define HEADER_META_LEN 8
 #define HEADER_SIZE (HEADER_META_LEN + crypto_pwhash_SALTBYTES + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES)
 static const unsigned char VAULT_MAGIC[VAULT_MAGIC_LEN] = { 'S', 'P', 'M', '1' };
@@ -383,8 +384,35 @@ int vault_save(const char *master_password, const Credential *entries, size_t co
     return vault_write_file(master_password, entries, count, 0);
 }
 
-// Open the vault file, verify ownership and header AAD, and decrypt all entries.
-int vault_load(const char *master_password, Credential *entries, size_t *count_out) {
+// Update the unauthenticated fail-count byte on the verified vault inode while blocking signals.
+static int update_fail_count(const struct stat *orig_st, unsigned char new_count) {
+    sigset_t block_set, old_set;
+    sigemptyset(&block_set);
+    sigaddset(&block_set, SIGINT);
+    sigaddset(&block_set, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &block_set, &old_set) != 0) return -1;
+
+    int fd = open(VAULT_FILE, O_RDWR | O_NOFOLLOW | O_NONBLOCK);
+    int ok = 0;
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) == 0 && valid_vault_stat(&st) &&
+            st.st_dev == orig_st->st_dev && st.st_ino == orig_st->st_ino) {
+            ssize_t w;
+            do {
+                w = pwrite(fd, &new_count, 1, FAIL_OFFSET);
+            } while (w < 0 && errno == EINTR);
+            if (w == 1 && fsync(fd) == 0) ok = 1;
+        }
+        if (close(fd) != 0) ok = 0;
+    }
+    sigprocmask(SIG_SETMASK, &old_set, NULL);
+    return ok ? 0 : -1;
+}
+
+// Open vault.bin, verify ownership and header AAD, enforce max failed attempts, and decrypt entries.
+int vault_load(const char *master_password, Credential *entries, size_t *count_out, int *attempts_left_out) {
+    if (attempts_left_out) *attempts_left_out = -1;
     if (!master_password || !master_password[0] || !entries || !count_out) return -1;
     *count_out = 0;
 
@@ -418,10 +446,25 @@ int vault_load(const char *master_password, Credential *entries, size_t *count_o
     }
 
     if (memcmp(header, VAULT_MAGIC, VAULT_MAGIC_LEN) != 0 ||
-        header[4] != VAULT_VERSION || header[5] != 0 || header[6] != 0 || header[7] != 0) {
+        header[4] != VAULT_VERSION || header[6] != 0 || header[7] != 0) {
         wipe_buffer(cipher, sizeof(cipher));
         return -1;
     }
+
+    unsigned char fail_count = header[FAIL_OFFSET];
+    if (fail_count >= MAX_FAIL_ATTEMPTS) {
+        wipe_buffer(cipher, sizeof(cipher));
+        if (vault_delete() == 0) {
+            if (attempts_left_out) *attempts_left_out = 0;
+            return -2;
+        }
+        return -1;
+    }
+
+    // Zero the mutable fail_count slot in the AAD copy so Poly1305 verifies immutable metadata.
+    unsigned char aad[HEADER_SIZE];
+    memcpy(aad, header, sizeof(aad));
+    aad[FAIL_OFFSET] = 0;
 
     const unsigned char *salt = header + HEADER_META_LEN;
     const unsigned char *nonce = salt + crypto_pwhash_SALTBYTES;
@@ -438,23 +481,41 @@ int vault_load(const char *master_password, Credential *entries, size_t *count_o
 
     unsigned long long opened_len = 0;
     int opened = crypto_aead_xchacha20poly1305_ietf_decrypt(
-        (unsigned char *)entries, &opened_len, NULL, cipher, cipher_len, header, sizeof(header), nonce, key);
+        (unsigned char *)entries, &opened_len, NULL, cipher, cipher_len, aad, sizeof(aad), nonce, key);
     secure_free(key);
     wipe_buffer(cipher, sizeof(cipher));
 
-    if (opened != 0 || opened_len != plain_len) {
+    int records_ok = (opened == 0 && opened_len == plain_len);
+    size_t loaded_count = records_ok ? (plain_len / sizeof(Credential)) : 0;
+    if (records_ok) {
+        for (size_t i = 0; i < loaded_count; i++) {
+            if (!valid_record(&entries[i])) { records_ok = 0; break; }
+        }
+    }
+
+    if (!records_ok) {
+        wipe_buffer(entries, MAX_ENTRIES * sizeof(*entries));
+        unsigned char next_fail = (unsigned char)(fail_count + 1);
+        if (next_fail >= MAX_FAIL_ATTEMPTS) {
+            if (vault_delete() == 0) {
+                if (attempts_left_out) *attempts_left_out = 0;
+                return -2;
+            }
+            return -1;
+        }
+        if (update_fail_count(&st, next_fail) == 0 && attempts_left_out) {
+            *attempts_left_out = MAX_FAIL_ATTEMPTS - (int)next_fail;
+        }
+        return -1;
+    }
+
+    if (fail_count > 0 && update_fail_count(&st, 0) != 0) {
         wipe_buffer(entries, MAX_ENTRIES * sizeof(*entries));
         return -1;
     }
 
-    *count_out = plain_len / sizeof(Credential);
-    for (size_t i = 0; i < *count_out; i++) {
-        if (!valid_record(&entries[i])) {
-            wipe_buffer(entries, MAX_ENTRIES * sizeof(*entries));
-            *count_out = 0;
-            return -1;
-        }
-    }
+    *count_out = loaded_count;
+    if (attempts_left_out) *attempts_left_out = MAX_FAIL_ATTEMPTS;
     return 0;
 }
 

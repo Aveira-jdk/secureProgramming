@@ -5,9 +5,10 @@
 
 #define VAULT_FILE  "vault.bin"
 #define LOG_FILE    "spm.log"
-#define MAX_ENTRIES 50
-#define STR_LEN     64
-#define PASS_LEN    128
+#define MAX_ENTRIES       50
+#define STR_LEN           64
+#define PASS_LEN          128
+#define MAX_FAIL_ATTEMPTS 10
 
 // One saved entry. Fixed size keeps it simple and safe.
 typedef struct {
@@ -46,8 +47,8 @@ int vault_create(const char *master_password);
 // Encrypt and save all entries to an existing owned vault file.
 int vault_save(const char *master_password, const Credential *entries, size_t count);
 
-// Decrypt and load all entries from the vault file.
-int vault_load(const char *master_password, Credential *entries, size_t *count_out);
+// Decrypt and load entries. Returns 0 on success, -1 on error, or -2 if wiped after max failed attempts.
+int vault_load(const char *master_password, Credential *entries, size_t *count_out, int *attempts_left_out);
 
 // Overwrite and delete an existing owned vault file.
 int vault_delete(void);
