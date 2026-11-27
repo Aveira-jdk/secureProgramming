@@ -1,7 +1,7 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -Werror -pedantic -fanalyzer -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE -pie -g
+CFLAGS = -O2 -Wall -Wextra -Werror -pedantic -fanalyzer -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE -g
 ASAN_CFLAGS = -Wall -Wextra -Werror -pedantic -g -O1 -fsanitize=address,undefined
-LDFLAGS = -lsodium
+LDFLAGS = -pie -lsodium
 
 SRC_DIR = src
 OBJ_DIR = obj

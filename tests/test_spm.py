@@ -254,6 +254,17 @@ def test_init_and_validation(tmp):
     rc, _, echo = wait_tty(p, m)
     assert rc == 0 and echo
 
+    # Embedded NUL before newline must fail without eating the next input line
+    r_nul = subprocess.run(
+        [SPM],
+        cwd=d,
+        input=b"list\n" + MASTER_PW.encode() + b"\nadd nul.org\nbob\nbad\x00pw\nlist\nexit\n",
+        capture_output=True,
+    )
+    assert r_nul.returncode == 0
+    assert b"Invalid entry password." in r_nul.stderr
+    assert b"a._-@+1 (user: u._-@+2)" in r_nul.stdout
+
     # Exact 126-char max master password init + unlock check
     d_max = os.path.join(tmp, "max_master")
     os.makedirs(d_max)
@@ -287,12 +298,14 @@ def test_crud_clipboard_and_capacity(tmp):
     mockbin = os.path.join(tmp, "mockbin")
     os.makedirs(mockbin)
     cap = os.path.join(tmp, "clip.txt")
+    clip_args = os.path.join(tmp, "clip_args.txt")
     wl = os.path.join(mockbin, "wl-copy")
     with open(wl, "w", encoding="utf-8") as f:
-        f.write(f"#!/bin/sh\ncat > {cap}\n")
+        f.write(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {clip_args}\ncat > {cap}\n")
     os.chmod(wl, 0o755)
     env_mock = dict(os.environ)
     env_mock["PATH"] = mockbin + ":/usr/bin:/bin"
+    env_mock["SPM_CLIP_TIMEOUT"] = "1"
 
     p, m = spawn_pty(d, env=env_mock)
     read_until(m, b"spm> ")
@@ -325,11 +338,20 @@ def test_crud_clipboard_and_capacity(tmp):
     os.write(m, b"UpdatedSecret_0!\n")
     assert b"Entry saved." in read_until(m, b"spm> ")
 
-    # get uses mock wl-copy and prints service (user: ...) + service (pass: in clipboard)
+    # get copies secret, prints lifetime, and timer automatically runs --clear after TTL
     os.write(m, b"get svc0.org\n")
     out = read_until(m, b"spm> ")
-    assert b"svc0.org (user: upd@ex.org)" in out and b"svc0.org (pass: in clipboard)" in out
+    assert b"svc0.org (user: upd@ex.org)" in out
+    assert b"svc0.org (pass: in clipboard)" in out
+    assert b"Clipboard clears in 1 second(s)." in out
     assert open(cap, "r", encoding="utf-8").read() == "UpdatedSecret_0!"
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if open(cap, "r", encoding="utf-8").read() == "":
+            break
+        time.sleep(0.1)
+    assert open(cap, "r", encoding="utf-8").read() == ""
+    assert open(clip_args, "r", encoding="utf-8").read().splitlines() == ["", "--clear"]
 
     # Delete all 50 entries down to empty vault
     for i in range(50):

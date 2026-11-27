@@ -50,46 +50,119 @@ static int find_service(const Credential *entries, size_t count, const char *ser
     return -1;
 }
 
-// Check whether an executable file exists in an absolute directory listed in PATH.
-static int command_in_path(const char *name) {
+// Resolve an executable inside absolute directories listed in PATH only.
+static int resolve_command_path(const char *name, char *out, size_t out_sz) {
     const char *path_env = getenv("PATH");
-    if (!path_env || !path_env[0] || !name || !name[0]) return 0;
+    if (!path_env || !path_env[0] || !name || !name[0] || !out || !out_sz) return 0;
 
     const char *p = path_env;
     while (*p) {
         const char *sep = strchr(p, ':');
         size_t dir_len = sep ? (size_t)(sep - p) : strlen(p);
-        char full[4096];
-        if (dir_len > 0 && dir_len < sizeof(full) && p[0] == '/') {
-            int n = snprintf(full, sizeof(full), "%.*s/%s", (int)dir_len, p, name);
+        if (dir_len > 0 && dir_len < out_sz && p[0] == '/') {
+            int n = snprintf(out, out_sz, "%.*s/%s", (int)dir_len, p, name);
             struct stat st;
-            if (n > 0 && (size_t)n < sizeof(full) &&
-                stat(full, &st) == 0 && S_ISREG(st.st_mode) && access(full, X_OK) == 0) {
+            if (n > 0 && (size_t)n < out_sz &&
+                stat(out, &st) == 0 && S_ISREG(st.st_mode) && access(out, X_OK) == 0) {
                 return 1;
             }
         }
         if (!sep) break;
         p = sep + 1;
     }
+    out[0] = '\0';
     return 0;
 }
 
-// Copy password directly via fork/execvp without spawning a shell.
-static int copy_to_clipboard(const char *password) {
+static void reset_child_signals(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGPIPE, &sa, NULL);
+    sigaction(SIGTSTP, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+}
+
+// Allow SPM_CLIP_TIMEOUT only to shorten clipboard lifetime within [1, CLIPBOARD_TTL_SEC].
+static unsigned int get_clipboard_ttl(void) {
+    const char *env = getenv("SPM_CLIP_TIMEOUT");
+    if (!env || !env[0]) return CLIPBOARD_TTL_SEC;
+    unsigned long val = 0;
+    for (const char *p = env; *p; p++) {
+        if (*p < '0' || *p > '9') return CLIPBOARD_TTL_SEC;
+        val = val * 10 + (unsigned long)(*p - '0');
+        if (val > CLIPBOARD_TTL_SEC) return CLIPBOARD_TTL_SEC;
+    }
+    return (val >= 1) ? (unsigned int)val : CLIPBOARD_TTL_SEC;
+}
+
+// Double-fork a detached helper that wipes inherited secrets, sleeps ttl_sec, and clears the clipboard.
+static int schedule_clipboard_clear(const char *tool_path, char *const clear_argv[],
+                                    unsigned int ttl_sec, void *secret1, void *secret2) {
+    pid_t pid1 = fork();
+    if (pid1 < 0) return -1;
+    if (pid1 == 0) {
+        pid_t pid2 = fork();
+        if (pid2 < 0) _exit(1);
+        if (pid2 > 0) _exit(0);
+
+        secure_free(secret1);
+        secure_free(secret2);
+        (void)setsid();
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull < 0) _exit(127);
+        if (dup2(devnull, STDIN_FILENO) < 0 ||
+            dup2(devnull, STDOUT_FILENO) < 0 ||
+            dup2(devnull, STDERR_FILENO) < 0) _exit(127);
+        if (devnull > STDERR_FILENO) close(devnull);
+        if (chdir("/") != 0) _exit(127);
+        reset_child_signals();
+
+        unsigned int rem = ttl_sec;
+        while (rem > 0) rem = sleep(rem);
+        execv(tool_path, clear_argv);
+        _exit(127);
+    }
+
+    int status = 0;
+    while (waitpid(pid1, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+// Copy password directly via fork/execv without a shell and schedule automatic clearing.
+static int copy_to_clipboard(const char *password, void *secret1, void *secret2,
+                             unsigned int *ttl_out, int *clear_ok_out) {
     static char tool_wl[] = "wl-copy";
+    static char arg_clear[] = "--clear";
     static char tool_xclip[] = "xclip";
     static char arg_sel[] = "-selection";
     static char arg_clip[] = "clipboard";
     static char tool_win[] = "clip.exe";
     char *const wl_argv[] = { tool_wl, NULL };
+    char *const wl_clear_argv[] = { tool_wl, arg_clear, NULL };
     char *const xclip_argv[] = { tool_xclip, arg_sel, arg_clip, NULL };
     char *const win_argv[] = { tool_win, NULL };
 
+    char tool_path[4096];
     char *const *argv = NULL;
-    if (command_in_path("wl-copy")) argv = wl_argv;
-    else if (command_in_path("xclip")) argv = xclip_argv;
-    else if (command_in_path("clip.exe")) argv = win_argv;
-    else return -1;
+    char *const *clear_argv = NULL;
+    if (resolve_command_path("wl-copy", tool_path, sizeof(tool_path))) {
+        argv = wl_argv;
+        clear_argv = wl_clear_argv;
+    } else if (resolve_command_path("xclip", tool_path, sizeof(tool_path))) {
+        argv = xclip_argv;
+        clear_argv = xclip_argv;
+    } else if (resolve_command_path("clip.exe", tool_path, sizeof(tool_path))) {
+        argv = win_argv;
+        clear_argv = win_argv;
+    } else {
+        return -1;
+    }
 
     int pfd[2];
     if (pipe(pfd) != 0) return -1;
@@ -122,13 +195,8 @@ static int copy_to_clipboard(const char *password) {
         if (dup2(devnull, STDOUT_FILENO) < 0 || dup2(devnull, STDERR_FILENO) < 0) _exit(127);
         if (devnull != STDOUT_FILENO && devnull != STDERR_FILENO) close(devnull);
 
-        signal(SIGPIPE, SIG_DFL);
-        signal(SIGTSTP, SIG_DFL);
-        signal(SIGINT, SIG_DFL);
-        signal(SIGTERM, SIG_DFL);
-        signal(SIGHUP, SIG_DFL);
-
-        execvp(argv[0], argv);
+        reset_child_signals();
+        execv(tool_path, argv);
         _exit(127);
     }
 
@@ -150,7 +218,13 @@ static int copy_to_clipboard(const char *password) {
         if (errno != EINTR) { ok = 0; break; }
     }
     sigaction(SIGPIPE, &old_pipe, NULL);
-    return (ok && WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+    if (!(ok && WIFEXITED(status) && WEXITSTATUS(status) == 0)) return -1;
+
+    unsigned int ttl_sec = get_clipboard_ttl();
+    int clear_ok = (schedule_clipboard_clear(tool_path, clear_argv, ttl_sec, secret1, secret2) == 0);
+    if (ttl_out) *ttl_out = ttl_sec;
+    if (clear_ok_out) *clear_ok_out = clear_ok;
+    return 0;
 }
 
 // Print command help and how to use the program.
@@ -401,14 +475,18 @@ static int run_command(const char *command, const char *arg, char *master, size_
             fputs("Entry not found.\n", stderr);
             return -1;
         }
-        if (copy_to_clipboard(entries[index].password) != 0) {
+        unsigned int clip_ttl = CLIPBOARD_TTL_SEC;
+        int clear_ok = 0;
+        if (copy_to_clipboard(entries[index].password, master, entries, &clip_ttl, &clear_ok) != 0) {
             log_event("GET", "FAIL", "clipboard_failed");
             fputs("Could not copy to clipboard.\n", stderr);
             return -1;
         }
-        log_event("GET", "OK", "clipboard_started");
+        log_event("GET", "OK", clear_ok ? "clipboard_ttl" : "clipboard_no_clear");
         printf("%s (user: %s)\n%s (pass: in clipboard)\n",
                entries[index].service, entries[index].username, entries[index].service);
+        if (clear_ok) printf("Clipboard clears in %u second(s).\n", clip_ttl);
+        else fputs("Warning: could not schedule clipboard clear.\n", stderr);
         return handle_pending_signals() != 0 ? -2 : 0;
     }
 
@@ -487,11 +565,10 @@ static int finish_signal_exit(void) {
 
 int main(int argc, char **argv) {
     // Start up libsodium security library.
-    if (sodium_init() < 0 || disable_core_dumps() != 0) {
+    if (sodium_init() < 0 || disable_core_dumps() != 0 || setup_signals() != 0) {
         fputs("Secure storage is unavailable.\n", stderr);
         return 1;
     }
-    setup_signals();
 
     if (argc < 1) { usage("spm", 0); return 1; }
     const char *prog = argv[0] ? argv[0] : "spm";

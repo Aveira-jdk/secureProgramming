@@ -9,6 +9,7 @@
 #define STR_LEN           64
 #define PASS_LEN          128
 #define MAX_FAIL_ATTEMPTS 10
+#define CLIPBOARD_TTL_SEC 30
 
 // One saved entry. Fixed size keeps it simple and safe.
 typedef struct {
@@ -17,8 +18,8 @@ typedef struct {
     char password[PASS_LEN];
 } Credential;
 
-// Install handlers for SIGINT, SIGTERM, and SIGHUP, and ignore SIGTSTP.
-void setup_signals(void);
+// Install handlers for SIGINT, SIGTERM, and SIGHUP, and ignore SIGTSTP. Returns 0 or -1.
+int setup_signals(void);
 
 // Prompt or report pending signal exit. Returns 0 to continue or exit code (e.g. 130).
 int handle_pending_signals(void);

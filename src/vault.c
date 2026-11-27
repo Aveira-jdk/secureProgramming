@@ -48,19 +48,43 @@ static void signal_handler(int sig) {
     errno = saved_errno;
 }
 
-void setup_signals(void) {
+// Reject lines containing embedded NUL bytes or exceeding size - 1 (must zero buf before fgets).
+static int finish_fgets_line(char *buf, size_t size) {
+    char *nl = memchr(buf, '\n', size);
+    if (nl) {
+        size_t idx = (size_t)(nl - buf);
+        if (memchr(buf, '\0', idx) != NULL) {
+            wipe_buffer(buf, size);
+            return -1;
+        }
+        buf[idx] = '\0';
+        return 0;
+    }
+    if (!feof(stdin)) {
+        int ch;
+        while ((ch = getchar()) != '\n' && ch != EOF) {}
+        wipe_buffer(buf, size);
+        return -1;
+    }
+    return 0;
+}
+
+int setup_signals(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGHUP, &sa, NULL);
+    if (sigaction(SIGINT, &sa, NULL) != 0 ||
+        sigaction(SIGTERM, &sa, NULL) != 0 ||
+        sigaction(SIGHUP, &sa, NULL) != 0) {
+        return -1;
+    }
 
     // Ignore Ctrl+Z so unlocked secrets cannot be suspended in RAM or leave ECHO off.
     sa.sa_handler = SIG_IGN;
-    sigaction(SIGTSTP, &sa, NULL);
+    if (sigaction(SIGTSTP, &sa, NULL) != 0) return -1;
+    return 0;
 }
 
 static int confirm_sigint_exit(void) {
@@ -79,15 +103,11 @@ static int confirm_sigint_exit(void) {
             return 1;
         }
 
-        size_t len = strlen(ans);
-        if (len && ans[len - 1] == '\n') {
-            ans[--len] = '\0';
-        } else if (!feof(stdin)) {
-            int ch;
-            while ((ch = getchar()) != '\n' && ch != EOF) {}
+        if (finish_fgets_line(ans, sizeof(ans)) != 0) {
             clearerr(stdin);
             continue;
         }
+        size_t len = strlen(ans);
 
         if ((ans[0] == 'y' || ans[0] == 'Y') && len == 1) {
             g_in_confirm = 0;
@@ -169,8 +189,9 @@ int prompt_input(const char *prompt, char *buffer, size_t size, int hidden) {
         // Show prompt to the user.
         if (prompt) { fputs(prompt, stdout); fflush(stdout); }
 
-        // Read the line from stdin unless a signal already interrupted before fgets.
+        // Zero buffer first so finish_fgets_line() can detect embedded NUL bytes.
         clearerr(stdin);
+        wipe_buffer(buffer, size);
         char *result = NULL;
         if (!g_term_sig && !g_got_sigint) {
             result = fgets(buffer, (int)size, stdin);
@@ -202,19 +223,7 @@ int prompt_input(const char *prompt, char *buffer, size_t size, int hidden) {
             continue;
         }
 
-        // Strip trailing newline character.
-        size_t len = strlen(buffer);
-        if (len && buffer[len - 1] == '\n') {
-            buffer[--len] = '\0';
-        }
-        // If input exceeded buffer size, clear extra characters to keep stdin clean.
-        else if (!feof(stdin)) {
-            int ch;
-            while ((ch = getchar()) != '\n' && ch != EOF) {}
-            wipe_buffer(buffer, size);
-            return -1;
-        }
-        return 0;
+        return finish_fgets_line(buffer, size);
     }
 }
 
@@ -281,6 +290,16 @@ static int valid_vault_stat(const struct stat *st) {
            st->st_uid == getuid() &&
            st->st_gid == getgid() &&
            (st->st_mode & 0777) == 0600;
+}
+
+// Flush containing directory metadata so create, rename, and unlink persist across crashes.
+static int sync_parent_dir(void) {
+    int dir_fd = open(".", O_RDONLY | O_DIRECTORY);
+    if (dir_fd < 0) return -1;
+    int rc = fsync(dir_fd);
+    if (rc != 0 && (errno == EINVAL || errno == EBADF)) rc = 0;
+    if (close(dir_fd) != 0) return -1;
+    return rc == 0 ? 0 : -1;
 }
 
 // Encrypt and write vault.bin either atomically as new (create_only=1) or via temp rename (create_only=0).
@@ -363,10 +382,16 @@ static int vault_write_file(const char *master_password, const Credential *entri
     if (fd >= 0 && close(fd) != 0) ok = 0;
 
     if (!create_only) {
-        if (ok && rename(temp, VAULT_FILE) != 0) ok = 0;
-        if (!ok && fd >= 0) unlink(temp);
-    } else if (!ok && opened_exclusive) {
-        unlink(VAULT_FILE);
+        int renamed = 0;
+        if (ok) {
+            if (rename(temp, VAULT_FILE) == 0) renamed = 1;
+            else ok = 0;
+        }
+        if (renamed && sync_parent_dir() != 0) ok = 0;
+        if (!ok && !renamed && fd >= 0) unlink(temp);
+    } else {
+        if (ok && sync_parent_dir() != 0) ok = 0;
+        if (!ok && opened_exclusive) unlink(VAULT_FILE);
     }
 
     if (blocked) sigprocmask(SIG_SETMASK, &old_set, NULL);
@@ -553,6 +578,7 @@ int vault_delete(void) {
 
     if (close(fd) != 0) ok = 0;
     if (ok && unlink(VAULT_FILE) != 0) ok = 0;
+    if (ok && sync_parent_dir() != 0) ok = 0;
     if (blocked) sigprocmask(SIG_SETMASK, &old_set, NULL);
     return ok ? 0 : -1;
 }
